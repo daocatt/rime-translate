@@ -25,7 +25,7 @@ curl -fL https://raw.githubusercontent.com/daocatt/rime-translate/main/scripts/i
 |---|---|
 | helper 常驻进程（词典查询 + AI 兜底） | `/usr/local/bin/rime-translate-helper` |
 | Lua 翻译插件 | `~/Library/Rime/lua/rime_translate.lua` |
-| 全量离线词典（ECDICT 反向索引） | `~/Library/Application Support/rime-translate/ecdict.db` |
+| 全量离线词典（ECDICT + CC-CEDICT） | `~/Library/Application Support/rime-translate/ecdict.db` |
 
 并注册开机自启（LaunchAgent），安装过程需要输入一次管理员密码。
 
@@ -89,5 +89,6 @@ patch:
 ## 许可协议
 
 - 本项目代码：**MIT**（见 [LICENSE](LICENSE)）
-- 词典数据来自 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT，见 [`LICENSES/ECDICT-LICENSE.txt`](LICENSES/ECDICT-LICENSE.txt)）
+- 词典数据：[ECDICT](https://github.com/skywind3000/ECDICT)（MIT）+ [CC-CEDICT](https://www.mdbg.net/chinese/dictionary?page=cedict)（CC-BY-SA 4.0）
+  —— 合并后的离线数据包 `ecdict.db` 按 **CC-BY-SA 4.0** 分发，见 [`LICENSES/`](LICENSES/)
 - 本项目是运行时插件，不包含、不修改、不分发 Squirrel/librime 源码或二进制

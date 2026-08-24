@@ -1,0 +1,18 @@
+CC-CEDICT
+=========
+
+This data package incorporates CC-CEDICT (https://www.mdbg.net/chinese/dictionary?page=cedict),
+copyright MDBG / CC-CEDICT contributors.
+
+Licensed under the Creative Commons Attribution-ShareAlike 4.0 International
+License (CC-BY-SA 4.0): https://creativecommons.org/licenses/by-sa/4.0/
+
+In accordance with the ShareAlike requirement, the derived offline dictionary
+package (ecdict.db) distributed by the rime-translate project is made
+available under CC-BY-SA 4.0. Attribution: rime-translate project,
+data from ECDICT (MIT) and CC-CEDICT (CC-BY-SA 4.0).
+
+Also used at build time (not distributed): jieba word frequency list
+(https://github.com/fxsjy/jieba, Apache License 2.0), used solely for
+ordering; no jieba data is embedded in the dictionary package beyond
+integer frequency values of Chinese words.

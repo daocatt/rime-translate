@@ -55,6 +55,56 @@ def load_evidenced_words(path):
         conn.close()
 
 
+CEDICT_LINE = re.compile(r"^\S+ (\S+) \[[^\]]*\] /(.+)/\s*$")
+
+
+def parse_cedict(path):
+    """Parse CC-CEDICT (native Chinese->English) into zh -> [en, ...].
+    These definitions get front-of-list priority over inverted ECDICT."""
+    mapping = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            m = CEDICT_LINE.match(line)
+            if not m:
+                continue
+            zh, defs_raw = m.group(1), m.group(2)
+            if not (1 <= len(zh) <= MAX_ZH_LEN):
+                continue
+            defs = []
+            for seg in defs_raw.split("/"):
+                seg = seg.strip()
+                if not seg or seg.startswith("CL:") or seg.startswith("see "):
+                    continue
+                if seg not in defs:
+                    defs.append(seg)
+            if defs:
+                cur = mapping.setdefault(zh, [])
+                for d in defs:
+                    if d not in cur:
+                        cur.append(d)
+    # everyday senses first across ALL entries of a word: lowercase common
+    # nouns beat proper nouns and parenthesized qualifiers
+    for defs in mapping.values():
+        defs.sort(key=lambda d: (d[:1].isupper(), "(" in d))
+    return mapping
+
+
+def load_zh_freq(path):
+    """jieba-style word frequency list -> {word: freq}."""
+    freq = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    freq[parts[0]] = int(parts[1])
+                except ValueError:
+                    continue
+    return freq
+
+
 def is_inflection(word_lower, evidenced):
     """Catch derived forms that ECDICT's exchange field misses
     (e.g. 'beautifuler' whose exchange points at itself).
@@ -70,18 +120,22 @@ def is_inflection(word_lower, evidenced):
 
 
 def zh_phrases(translation):
-    """Extract normalized Chinese phrases from an ECDICT translation field."""
+    """Extract (phrase, position) from an ECDICT translation field.
+    Position = order of first appearance; earlier senses are primary."""
     out = []
-    seen = set()
+    seen = {}
+    i = 0
     for line in (translation or "").split("\n"):
         line = POS_PREFIX.sub("", line)
         line = USAGE_LABEL.sub(" ", line)  # drop (美)/(英)/[医] style labels
         for raw in PHRASE_SPLIT.split(line):
             for m in CJK_RUN.finditer(raw):
                 p = m.group(0).strip("·")
-                if 1 <= len(p) <= MAX_ZH_LEN and p not in seen:
-                    seen.add(p)
-                    out.append(p)
+                if 1 <= len(p) <= MAX_ZH_LEN:
+                    if p not in seen:
+                        seen[p] = i
+                        out.append((p, i))
+                    i += 1
     return out
 
 
@@ -155,6 +209,10 @@ def main():
                          "(0 = keep all, full dictionary)")
     ap.add_argument("--min-score", type=float, default=0.0,
                     help="drop english words scoring below this (0 = keep all)")
+    ap.add_argument("--cedict",
+                    help="CC-CEDICT file merged as a high-priority source")
+    ap.add_argument("--zh-freq",
+                    help="jieba-style word frequency list; ranks the hot cache")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -171,6 +229,11 @@ def main():
         print(f"  {len(evidenced)} evidenced words", file=sys.stderr)
     else:
         evidenced = set()
+
+    cedict_map = parse_cedict(args.cedict) if args.cedict else {}
+    print(f"cc-cedict: {len(cedict_map)} entries", file=sys.stderr) if cedict_map else None
+    zh_freq = load_zh_freq(args.zh_freq) if args.zh_freq else {}
+    print(f"zh-freq: {len(zh_freq)} words", file=sys.stderr) if zh_freq else None
 
     t0 = time.time()
     n_words = 0
@@ -211,7 +274,10 @@ def main():
             if s < args.min_score:
                 continue
             k = args.max_per_word
-            for p in zh_phrases(row.get("translation")):
+            for p, pos in zh_phrases(row.get("translation")):
+                # sense-position weighting: the first mention of a phrase in
+                # a translation is its primary sense
+                weighted = s / (1.0 + 0.15 * pos)
                 variants = [p]
                 if p.endswith(("的", "地", "得")) and len(p) >= 2:
                     variants.append(p[:-1])
@@ -221,16 +287,16 @@ def main():
                     cnt = counts.get(wl, 0)
                     if cnt == 0:
                         if k > 0:
-                            entry = (s, word)
+                            entry = (weighted, word)
                             if len(h) < k:
                                 heapq.heappush(h, entry)
-                            elif s > h[0][0]:
+                            elif weighted > h[0][0]:
                                 old = heapq.heapreplace(h, entry)
                                 ol = old[1].lower()
                                 if counts.get(ol):
                                     counts[ol] -= 1
                         else:
-                            h.append((s, word))
+                            h.append((weighted, word))
                     counts[wl] = cnt + 1
         if n_words % 500000 == 0:
             print(f"  scanned {n_words} words (+{n_skipped} inflections skipped), "
@@ -246,9 +312,11 @@ def main():
         CREATE TABLE zh_en (
             zh TEXT PRIMARY KEY,
             en TEXT NOT NULL,
-            score REAL NOT NULL DEFAULT 0
+            score REAL NOT NULL DEFAULT 0,
+            zh_freq INTEGER NOT NULL DEFAULT 0
         ) WITHOUT ROWID;
         CREATE INDEX idx_zh_en_score ON zh_en(score DESC);
+        CREATE INDEX idx_zh_en_freq ON zh_en(zh_freq DESC);
         CREATE TABLE ai_cache (
             zh TEXT PRIMARY KEY,
             en TEXT NOT NULL,
@@ -267,15 +335,43 @@ def main():
         ranked = sorted(h, key=rank)
         words = [w for _, w in ranked]
         top_score = -rank(ranked[0])
-        batch.append((p, "|".join(words), top_score))
+
+        # CC-CEDICT is natively Chinese->English: clean defs go to the front
+        # of the list, heavily qualified ones "(concept of) time" fall behind
+        extra = cedict_map.get(p, [])
+        if extra:
+            extra_front = [d for d in extra if "(" not in d and not d[:1].isupper()]
+            extra_back = [d for d in extra if d not in extra_front]
+            merged, seen_l = [], set()
+            for w in extra_front + words + extra_back:
+                lw = w.lower()
+                if lw not in seen_l:
+                    seen_l.add(lw)
+                    merged.append(w)
+            words = merged
+
+        freq = zh_freq.get(p, 0)
+        batch.append((p, "|".join(words), top_score, freq))
         if len(batch) >= 10000:
-            db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?)", batch)
+            db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?,?)", batch)
             batch = []
     if batch:
-        db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?)", batch)
+        db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?,?)", batch)
+
+    # phrases that only CC-CEDICT covers (e.g. 手机 -> cell phone)
+    batch = []
+    for p, defs in cedict_map.items():
+        if p not in index:
+            freq = zh_freq.get(p, 0)
+            batch.append((p, "|".join(defs), 10.0 * len(defs), freq))
+            if len(batch) >= 10000:
+                db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?,?)", batch)
+                batch = []
+    if batch:
+        db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?,?)", batch)
     db.executemany("INSERT INTO meta VALUES (?,?)", [
-        ("source", "skywind3000/ECDICT"),
-        ("license", "MIT"),
+        ("source", "skywind3000/ECDICT + CC-CEDICT (MDBG)"),
+        ("license", "ECDICT: MIT; CC-CEDICT: CC-BY-SA 4.0 (data package)"),
         ("built_at", str(int(time.time()))),
         ("words_scanned", str(n_words)),
         ("phrases", str(len(index))),

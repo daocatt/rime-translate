@@ -68,7 +68,8 @@ final class Dict {
             sqlite3_exec(db, "PRAGMA cache_size=-32000;", nil, nil, nil)
             sqlite3_exec(db, """
                 CREATE TABLE IF NOT EXISTS zh_en (
-                    zh TEXT PRIMARY KEY, en TEXT NOT NULL, score REAL NOT NULL DEFAULT 0
+                    zh TEXT PRIMARY KEY, en TEXT NOT NULL,
+                    score REAL NOT NULL DEFAULT 0, zh_freq INTEGER NOT NULL DEFAULT 0
                 ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS ai_cache (
                     zh TEXT PRIMARY KEY, en TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -133,7 +134,7 @@ final class Dict {
             var out: [(String, String)] = []
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
-            let sql = "SELECT zh, en FROM zh_en ORDER BY score DESC LIMIT ?1"
+            let sql = "SELECT zh, en FROM zh_en ORDER BY zh_freq DESC, score DESC LIMIT ?1"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
             sqlite3_bind_int(stmt, 1, Int32(n))
             while sqlite3_step(stmt) == SQLITE_ROW {
