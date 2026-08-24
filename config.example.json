@@ -1,0 +1,6 @@
+{
+  "account_id": "your_cloudflare_account_id",
+  "api_token": "your_workers_ai_api_token",
+  "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  "timeout_seconds": 20
+}

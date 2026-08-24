@@ -48,8 +48,15 @@ local function trace(fmt, ...)
 end
 
 local function open_debug()
-    local f = io.open("/tmp/rime_translate_debug.log", "a")
+    -- keep the debug log bounded (512 KB): start fresh when oversized
+    local path = "/tmp/rime_translate_debug.log"
+    local f = io.open(path, "a")
     if not f then return end
+    if f:seek("end") > 524288 then
+        f:close()
+        f = io.open(path, "w")
+        if not f then return end
+    end
     dbg = f
     trace("=== session start, lua=%s popen=%s ===",
         _VERSION and tostring(_VERSION) or "?",
