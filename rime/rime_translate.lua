@@ -266,6 +266,7 @@ function M.fini(env) end
 
 function M.func(input, env)
     for cand in input:iter() do
+        local handled = false
         if cfg.enabled and is_cjk(cand.text) and cand.type ~= "raw" then
             local ok, en = pcall(lookup, cand.text)
             if ok and en then
@@ -279,12 +280,12 @@ function M.func(input, env)
                             local repl = Candidate("simplified", cand.start,
                                 cand._end, cand.text, "  " .. rendered)
                             repl.quality = cand.quality
+                            handled = true
+                            trace("replaced: %s [%s]", cand.text, rendered)
                             yield(repl)
                         end)
                         if not ok2 then
                             trace("replace FAILED (%s): %s", cand.text, tostring(err2))
-                        else
-                            trace("replaced: %s [%s]", cand.text, rendered)
                         end
                     else
                         cand.comment = (cand.comment or "") .. "  " .. rendered
@@ -293,7 +294,9 @@ function M.func(input, env)
                 end
             end
         end
-        yield(cand)
+        if not handled then
+            yield(cand)
+        end
     end
 end
 

@@ -247,32 +247,38 @@ func drainRequests(_ dict: Dict, hotDirty: HotDirty) {
           !raw.isEmpty else { return }
     try? "".write(to: requestsURL, atomically: true, encoding: .utf8)
 
-    var added = false
-    for word in raw.split(separator: "\n") {
-        let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
-        attemptedLock.lock()
-        let seen = attempted.contains(zh)
-        attemptedLock.unlock()
-        if seen { continue }
+        var added = false
+        for word in raw.split(separator: "\n") {
+            let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
+            attemptedLock.lock()
+            let seen = attempted.contains(zh)
+            attemptedLock.unlock()
+            if seen { continue }
 
-        var resolved = false
-        if dict.lookupDict(zh) != nil || dict.lookupCache(zh) != nil {
-            resolved = true
-        } else if let cfg = dict.aiConfig {
-            attemptedLock.lock(); attempted.insert(zh); attemptedLock.unlock()
-            let sem = DispatchSemaphore(value: 0)
-            Task.detached(priority: .utility) {
-                if let en = await translateWithAI(zh, cfg: cfg) {
-                    dict.insertCache(zh, en)
+            var added_word = false
+            if let en = dict.lookupDict(zh) {
+                // dict hit outside the top-30k hot cache: pin it into
+                // ai_cache so it lands in the exported hot cache too
+                dict.insertCache(zh, en)
+                added_word = true
+            } else if let cached = dict.lookupCache(zh) {
+                _ = cached
+                added_word = true
+            } else if let cfg = dict.aiConfig {
+                attemptedLock.lock(); attempted.insert(zh); attemptedLock.unlock()
+                let sem = DispatchSemaphore(value: 0)
+                Task.detached(priority: .utility) {
+                    if let en = await translateWithAI(zh, cfg: cfg) {
+                        dict.insertCache(zh, en)
+                    }
+                    sem.signal()
                 }
-                sem.signal()
+                _ = sem.wait(timeout: .now() + 15)
+                added_word = true
             }
-            _ = sem.wait(timeout: .now() + 15)
-            resolved = true
+            if added_word { added = true }
         }
-        if resolved { added = true }
-    }
     if added {
         exportHotCache(dict)
         NSLog("drained %d request(s)", raw.split(separator: "\n").count)
