@@ -26,6 +26,12 @@ CJK_RUN = re.compile(r"[\u3400-\u9fff][\u3400-\u9fff·]{0,11}")
 POS_PREFIX = re.compile(r"^\s*(?:[a-z]{1,4}\.\s*)+")
 PHRASE_SPLIT = re.compile(r"[，,；;。！？!?\s（）()【】\[\]「」『』/、]+")
 MAX_ZH_LEN = 12
+# dictionary usage labels: "(美)merican usage", "[医]medical", "(口语)", ...
+# these are NOT senses -- stripping them prevents 美->governor style junk
+LABEL = ("美英口俚喻贬史古方谑废主宾定语法化医军经计物生植动宗音诗"
+         "苏格兰澳新南非加拿大爱尔兰威尔士印度")
+USAGE_LABEL = re.compile(
+    r"[（\[(]\s*(?:%s){1,4}语?\s*[）\])]" % "|".join(LABEL))
 # exchange field lists derivations as ".../0:<lemma>"; a word whose lemma
 # differs from itself is an inflected form duplicating the lemma's senses
 EXCHANGE_LEMMA = re.compile(r"(?:^|/)(?:\d+:)?0:([^/]+)")
@@ -69,6 +75,7 @@ def zh_phrases(translation):
     seen = set()
     for line in (translation or "").split("\n"):
         line = POS_PREFIX.sub("", line)
+        line = USAGE_LABEL.sub(" ", line)  # drop (美)/(英)/[医] style labels
         for raw in PHRASE_SPLIT.split(line):
             for m in CJK_RUN.finditer(raw):
                 p = m.group(0).strip("·")
