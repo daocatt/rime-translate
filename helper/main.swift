@@ -53,6 +53,10 @@ final class Dict {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "rime-translate.dict")
     private(set) var aiConfig: AIConfig?
+    // prepared statements reused across lookups (all access serialized on queue)
+    private var stmtDict: OpaquePointer?
+    private var stmtCache: OpaquePointer?
+    private var stmtInsert: OpaquePointer?
 
     init(path: String, configURL: URL) throws {
         if sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) != SQLITE_OK {
@@ -61,6 +65,7 @@ final class Dict {
         }
         queue.sync {
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+            sqlite3_exec(db, "PRAGMA cache_size=-32000;", nil, nil, nil)
             sqlite3_exec(db, """
                 CREATE TABLE IF NOT EXISTS zh_en (
                     zh TEXT PRIMARY KEY, en TEXT NOT NULL, score REAL NOT NULL DEFAULT 0
@@ -69,6 +74,15 @@ final class Dict {
                     zh TEXT PRIMARY KEY, en TEXT NOT NULL, created_at INTEGER NOT NULL
                 );
                 """, nil, nil, nil)
+            var d: OpaquePointer?
+            sqlite3_prepare_v2(db, "SELECT en FROM zh_en WHERE zh = ?1", -1, &d, nil)
+            stmtDict = d
+            var c: OpaquePointer?
+            sqlite3_prepare_v2(db, "SELECT en FROM ai_cache WHERE zh = ?1", -1, &c, nil)
+            stmtCache = c
+            var i: OpaquePointer?
+            sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO ai_cache VALUES (?1, ?2, ?3)", -1, &i, nil)
+            stmtInsert = i
         }
         reloadConfig(configURL)
     }
@@ -77,22 +91,27 @@ final class Dict {
         queue.async { self.aiConfig = AIConfig.load(url) }
     }
 
-    private func query(_ sql: String, bind zh: String) -> String? {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
-        defer {}
-        sqlite3_bind_text(stmt, 1, zh, -1, SQLITE_TRANSIENT)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return String(cString: sqlite3_column_text(stmt, 0))
+    private func query(_ stmt: OpaquePointer?, bind zh: String) -> String? {
+        guard let stmt = stmt else { return nil }
+        // one prepared stmt per query type: serialize its full lifecycle
+        return queue.sync {
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            sqlite3_bind_text(stmt, 1, zh, -1, SQLITE_TRANSIENT)
+            defer { sqlite3_reset(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) else {
+                return nil
+            }
+            return String(cString: c)
+        }
     }
 
     func lookupDict(_ zh: String) -> String? {
-        queue.sync { query("SELECT en FROM zh_en WHERE zh = ?1", bind: zh) }
+        query(stmtDict, bind: zh)
     }
 
     func lookupCache(_ zh: String) -> String? {
-        queue.sync { query("SELECT en FROM ai_cache WHERE zh = ?1", bind: zh) }
+        query(stmtCache, bind: zh)
     }
 
     func insertCache(_ zh: String, _ en: String) {
@@ -175,6 +194,12 @@ func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
 
 // MARK: - Hot cache export
 
+func isCommonCJK(_ s: String) -> Bool {
+    // restrict hot-cache entries to the URO basic block so rare
+    // extension-A characters don't crowd out everyday words
+    return s.unicodeScalars.allSatisfy { ($0.value >= 0x4E00 && $0.value <= 0x9FA5) }
+}
+
 func exportHotCache(_ dict: Dict) {
     let dir = rimeDir()
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -182,11 +207,19 @@ func exportHotCache(_ dict: Dict) {
     let dst = dir.appendingPathComponent("rime_translate_cache.tsv")
 
     var lines: [String] = []
-    for p in dict.topPhrases(hotCacheTopN) where !p.zh.contains("\t") && !p.en.contains("\t") {
-        lines.append("\(p.zh)\t\(p.en)")
+    func truncated(_ en: String) -> String {
+        // lua renders at most max_entries_vertical (5); keep a small margin
+        let parts = en.split(separator: "|", maxSplits: 7)
+        return parts.joined(separator: "|")
+    }
+    for p in dict.topPhrases(hotCacheTopN * 3) {
+        guard !p.zh.contains("\t"), !p.en.contains("\t"),
+              p.zh.utf8.count <= 48, isCommonCJK(p.zh) else { continue }
+        lines.append("\(p.zh)\t\(truncated(p.en))")
+        if lines.count >= hotCacheTopN + dict.allCached().count { break }
     }
     for p in dict.allCached() where !p.zh.contains("\t") && !p.en.contains("\t") {
-        lines.append("\(p.zh)\t\(p.en)")
+        lines.append("\(p.zh)\t\(truncated(p.en))")
     }
     let payload = lines.joined(separator: "\n") + "\n"
     if (try? payload.write(to: tmp, atomically: true, encoding: .utf8)) != nil {
