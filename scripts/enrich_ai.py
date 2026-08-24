@@ -86,7 +86,7 @@ def main():
     ap.add_argument("--db", required=True)
     ap.add_argument("--account", required=True)
     ap.add_argument("--token", required=True)
-    ap.add_argument("--model", default="@cf/meta/m2m100-1.2b")
+    ap.add_argument("--model", default="@cf/meta/llama-3.3-70b-instruct-fp8-fast")
     ap.add_argument("--limit", type=int, default=500,
                     help="max words to enrich this run")
     ap.add_argument("--min-freq", type=int, default=50,
