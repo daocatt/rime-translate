@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dictionary sources
+        run: |
+          curl -fL --retry 3 -o ecdict.zip \
+            https://github.com/skywind3000/ECDICT/releases/download/1.0.28/ecdict-sqlite-28.zip
+          unzip -o -q ecdict.zip -d ecdict_sqlite
+          curl -fL --retry 3 -o cedict.txt.gz \
+            "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz"
+          gunzip -f cedict.txt.gz
+          curl -fL --retry 3 -o jieba_freq.txt \
+            https://raw.githubusercontent.com/fxsjy/jieba/master/extra_dict/dict.txt.small
+
+      - name: Build offline dictionary
+        run: |
+          python3 scripts/build_dict.py ecdict_sqlite/stardict.db \
+            --cedict cedict.txt --zh-freq jieba_freq.txt -o dist/ecdict.db
+
+      - name: Build helper (universal binary)
+        run: |
+          mkdir -p /tmp/build
+          swiftc -O -o /tmp/build/arm64 helper/main.swift -lsqlite3 \
+            -target arm64-apple-macosx13.0
+          swiftc -O -o /tmp/build/x86_64 helper/main.swift -lsqlite3 \
+            -target x86_64-apple-macosx13.0
+          lipo -create /tmp/build/arm64 /tmp/build/x86_64 -output dist/rime-translate-helper
+          cp rime/rime_translate.lua dist/rime_translate.lua
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then TAG="$GITHUB_REF_NAME"; else TAG="v$(date +%Y.%m.%d)"; fi
+          NOTES="离线中英词典 (ECDICT+CC-CEDICT, 共273万词条) + helper 通用二进制 (macOS 13+, arm64/x86_64) + lua 插件。
+          数据协议: ECDICT (MIT) + CC-CEDICT (CC-BY-SA 4.0); 代码 MIT。"
+          gh release create "$TAG" --title "rime-translate $TAG" --notes "$NOTES" \
+            dist/ecdict.db dist/rime-translate-helper dist/rime_translate.lua ||
+          gh release upload "$TAG" --clobber \
+            dist/ecdict.db dist/rime-translate-helper dist/rime_translate.lua
