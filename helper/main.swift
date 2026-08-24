@@ -256,6 +256,8 @@ func exportHotCache(_ dict: Dict) {
         lines.append("\(p.zh)\t\(truncated(p.en))")
         if lines.count >= hotCacheTopN + dict.allCached().count { break }
     }
+    // ai results LAST: the filter's loader overwrites duplicates as it reads,
+    // so curated/learned translations win over raw dictionary noise
     for p in dict.allCached() where !p.zh.contains("\t") && !p.en.contains("\t") {
         lines.append("\(p.zh)\t\(truncated(p.en))")
     }

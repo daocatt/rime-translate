@@ -219,7 +219,7 @@ local function render(en)
     for w in en:gmatch("[^|]+") do
         count = count + 1
         if count > limit then break end
-        parts[#parts + 1] = w
+        parts[#parts + 1] = w:match("^%s*(.-)%s*$")  -- trim
     end
     if count == 0 then return nil end
     return table.concat(parts, cfg.separator)

@@ -92,3 +92,17 @@ patch:
 - 词典数据：[ECDICT](https://github.com/skywind3000/ECDICT)（MIT）+ [CC-CEDICT](https://www.mdbg.net/chinese/dictionary?page=cedict)（CC-BY-SA 4.0）
   —— 合并后的离线数据包 `ecdict.db` 按 **CC-BY-SA 4.0** 分发，见 [`LICENSES/`](LICENSES/)
 - 本项目是运行时插件，不包含、不修改、不分发 Squirrel/librime 源码或二进制
+
+### 批量增强词典（可选）
+
+用 Workers AI 免费额度批量翻译高频词并沉淀到本地库：
+
+```bash
+python3 scripts/enrich_ai.py --db ~/Library/Application\ Support/rime-translate/ecdict.db \
+    --account <CF账号ID> --token <API Token> --limit 200
+```
+
+- 默认模型 `@cf/meta/m2m100-1.2b`（~0.3 neurons/次，免费日额度约 3 万次）
+- 推荐质量更高的 `--model @cf/meta/llama-3.3-70b-instruct-fp8-fast`
+- 断点续跑：进度存于 `<db>.enrich_ckpt`；结果写入 `ai_cache` 表并自动进入热缓存
+- 运行时兜底与批量增强共用 `ai_cache`——AI 结果永远优先于原始词典显示
