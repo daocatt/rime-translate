@@ -2,3 +2,6 @@
 dist/*.db
 *.o
 nohup.out
+config.json
+*.token
+.env

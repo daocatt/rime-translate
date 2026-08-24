@@ -34,6 +34,10 @@ struct AIConfig {
     var accountID = ""
     var apiToken = ""
     var model = defaultModel
+    var timeoutSeconds: Double = 15
+
+    // chat-style models need the messages API instead of text/source_lang
+    var chatStyle: Bool { !model.contains("m2m100") }
 
     static func load(_ url: URL) -> AIConfig? {
         guard let data = try? Data(contentsOf: url),
@@ -45,12 +49,15 @@ struct AIConfig {
         c.accountID = id
         c.apiToken = token
         if let m = obj["model"] as? String, !m.isEmpty { c.model = m }
+        if let t = obj["timeout_seconds"] as? Double, t > 0 { c.timeoutSeconds = t }
         return c
     }
 }
 
 final class Dict {
     private var db: OpaquePointer?
+    private var dbRO: OpaquePointer?   // separate read-only conn for exports,
+                                       // so big scans never block lookups
     private let queue = DispatchQueue(label: "rime-translate.dict")
     private(set) var aiConfig: AIConfig?
     // prepared statements reused across lookups (all access serialized on queue)
@@ -62,6 +69,9 @@ final class Dict {
         if sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) != SQLITE_OK {
             throw NSError(domain: "dict", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "cannot open \(path)"])
+        }
+        if sqlite3_open_v2(path, &dbRO, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
+            dbRO = nil
         }
         queue.sync {
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
@@ -85,7 +95,12 @@ final class Dict {
             sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO ai_cache VALUES (?1, ?2, ?3)", -1, &i, nil)
             stmtInsert = i
         }
-        reloadConfig(configURL)
+        sqlite3_exec(db, "PRAGMA busy_timeout=3000;", nil, nil, nil)
+        if dbRO != nil {
+            sqlite3_exec(dbRO!, "PRAGMA busy_timeout=5000;", nil, nil, nil)
+        }
+        // load AI config synchronously so the startup note is accurate
+        queue.sync { self.aiConfig = AIConfig.load(configURL) }
     }
 
     func reloadConfig(_ url: URL) {
@@ -128,35 +143,34 @@ final class Dict {
         }
     }
 
-    /// Top phrases by score for the hot cache file.
+    /// Top phrases for the hot cache file. Uses the read-only connection so
+    /// a long scan never blocks candidate lookups.
     func topPhrases(_ n: Int) -> [(zh: String, en: String)] {
-        queue.sync {
-            var out: [(String, String)] = []
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql = "SELECT zh, en FROM zh_en ORDER BY zh_freq DESC, score DESC LIMIT ?1"
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
-            sqlite3_bind_int(stmt, 1, Int32(n))
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                out.append((String(cString: sqlite3_column_text(stmt, 0)),
-                            String(cString: sqlite3_column_text(stmt, 1))))
-            }
-            return out
+        guard let db = dbRO else { return [] }
+        var out: [(String, String)] = []
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = "SELECT zh, en FROM zh_en ORDER BY zh_freq DESC, score DESC LIMIT ?1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int(stmt, 1, Int32(n))
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                        String(cString: sqlite3_column_text(stmt, 1))))
         }
+        return out
     }
 
     func allCached() -> [(zh: String, en: String)] {
-        queue.sync {
-            var out: [(String, String)] = []
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, "SELECT zh, en FROM ai_cache", -1, &stmt, nil) == SQLITE_OK else { return [] }
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                out.append((String(cString: sqlite3_column_text(stmt, 0)),
-                            String(cString: sqlite3_column_text(stmt, 1))))
-            }
-            return out
+        guard let db = dbRO else { return [] }
+        var out: [(String, String)] = []
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT zh, en FROM ai_cache", -1, &stmt, nil) == SQLITE_OK else { return [] }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                        String(cString: sqlite3_column_text(stmt, 1))))
         }
+        return out
     }
 }
 
@@ -169,8 +183,19 @@ func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
     req.httpMethod = "POST"
     req.setValue("Bearer \(cfg.apiToken)", forHTTPHeaderField: "Authorization")
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.timeoutInterval = 15
-    let body: [String: Any] = ["text": text, "source_lang": "chinese", "target_lang": "english"]
+    req.timeoutInterval = cfg.timeoutSeconds
+    let body: [String: Any]
+    if cfg.chatStyle {
+        // instruct/chat models (llama, qwen, kimi...): messages API
+        body = ["messages": [
+            ["role": "system",
+             "content": "Translate the Chinese word or phrase to English. Reply with up to 3 English translations separated by | , nothing else."],
+            ["role": "user", "content": text],
+        ], "max_tokens": 40]
+    } else {
+        // dedicated translation models (m2m100...)
+        body = ["text": text, "source_lang": "chinese", "target_lang": "english"]
+    }
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
     guard let (data, resp) = try? await URLSession.shared.data(for: req),
@@ -180,15 +205,25 @@ func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
           let result = obj["result"]
     else { return nil }
 
-    // translation models -> [{"translated_text": "..."}]; instruct models -> {"response": "..."}
+    func pick(_ s: String?) -> String? {
+        guard let t = s?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !t.isEmpty else { return nil }
+        return t
+    }
+    // translation models: result.translated_text (string or array)
+    if let dict = result as? [String: Any] {
+        if let one = pick(dict["translated_text"] as? String) { return one }
+        if let r = pick(dict["response"] as? String) { return r }
+    }
     if let arr = result as? [[String: Any]] {
         let parts = arr.compactMap { $0["translated_text"] as? String }
-        let joined = parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        return joined.isEmpty ? nil : joined
+        return pick(parts.joined(separator: " "))
     }
-    if let dict = result as? [String: Any], let r = dict["response"] as? String {
-        let t = r.trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.isEmpty ? nil : t
+    // chat models: result.choices[0].message.content
+    if let dict = result as? [String: Any],
+       let choices = dict["choices"] as? [[String: Any]],
+       let msg = choices.first?["message"] as? [String: Any] {
+        return pick(msg["content"] as? String)
     }
     return nil
 }
@@ -234,55 +269,59 @@ func exportHotCache(_ dict: Dict) {
 //
 // The lua filter never spawns processes while typing: on a hot-cache miss it
 // just appends the word to rime_translate_requests.txt (a plain file append).
-// This timer drains that file every second -- answering from SQLite or
-// Cloudflare AI -- then re-exports the hot cache with a bumped #rev header
+// A single async task drains that file every second -- answering from SQLite
+// or Cloudflare AI -- then re-exports the hot cache with a bumped #rev header
 // that the filter notices cheaply (reads one line) and reloads.
 
 let requestsURL = rimeDir().appendingPathComponent("rime_translate_requests.txt")
 var attempted = Set<String>()
-let attemptedLock = NSLock()
+let exportQueue = DispatchQueue(label: "rime-translate.export")
 
-func drainRequests(_ dict: Dict, hotDirty: HotDirty) {
+func doExportHotCache(_ dict: Dict) {
+    exportQueue.sync { exportHotCache(dict) }
+}
+
+func drainOnce(_ dict: Dict) async -> Bool {
     guard let raw = try? String(contentsOf: requestsURL, encoding: .utf8),
-          !raw.isEmpty else { return }
+          !raw.isEmpty else { return false }
     try? "".write(to: requestsURL, atomically: true, encoding: .utf8)
 
-        var added = false
-        for word in raw.split(separator: "\n") {
-            let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
-            attemptedLock.lock()
-            let seen = attempted.contains(zh)
-            attemptedLock.unlock()
-            if seen { continue }
+    var added = false
+    for word in raw.split(separator: "\n") {
+        let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
+        if attempted.contains(zh) { continue }
 
-            var added_word = false
-            if let en = dict.lookupDict(zh) {
-                // dict hit outside the top-30k hot cache: pin it into
-                // ai_cache so it lands in the exported hot cache too
+        var added_word = false
+        if let en = dict.lookupDict(zh) {
+            // dict hit outside the top-30k hot cache: pin it into
+            // ai_cache so it lands in the exported hot cache too
+            dict.insertCache(zh, en)
+            added_word = true
+        } else if dict.lookupCache(zh) != nil {
+            added_word = true
+        } else if let cfg = dict.aiConfig {
+            attempted.insert(zh)
+            // fully async: no semaphore, never blocks the caller
+            if let en = await translateWithAI(zh, cfg: cfg) {
                 dict.insertCache(zh, en)
                 added_word = true
-            } else if let cached = dict.lookupCache(zh) {
-                _ = cached
-                added_word = true
-            } else if let cfg = dict.aiConfig {
-                attemptedLock.lock(); attempted.insert(zh); attemptedLock.unlock()
-                let sem = DispatchSemaphore(value: 0)
-                Task.detached(priority: .utility) {
-                    if let en = await translateWithAI(zh, cfg: cfg) {
-                        dict.insertCache(zh, en)
-                    }
-                    sem.signal()
-                }
-                _ = sem.wait(timeout: .now() + 15)
-                added_word = true
+                NSLog("ai: %@ -> %@", zh, en)
             }
-            if added_word { added = true }
         }
-    if added {
-        exportHotCache(dict)
-        NSLog("drained %d request(s)", raw.split(separator: "\n").count)
-        _ = hotDirty
+        if added_word { added = true }
+    }
+    return added
+}
+
+func drainLoop(_ dict: Dict) -> Task<Void, Never> {
+    return Task.detached(priority: .utility) {
+        while !Task.isCancelled {
+            if await drainOnce(dict) {
+                doExportHotCache(dict)
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
     }
 }
 
@@ -432,17 +471,41 @@ if dict.topPhrases(1).isEmpty {
 let pending = NegativeCache()
 let hotDirty = HotDirty()
 
-exportHotCache(dict)
+// start serving BEFORE the heavy initial export so restarts are instant
+let params = NWParameters.tcp
+params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
+let listener = try NWListener(using: params)
+listener.newConnectionHandler = { (conn: NWConnection) in
+    conn.start(queue: .global(qos: .userInitiated))
+    conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, error in
+        if let data = data, error == nil {
+            handleRequest(data, dict: dict, pending: pending, hotDirty: hotDirty, conn: conn)
+        } else {
+            conn.cancel()
+        }
+    }
+}
+listener.stateUpdateHandler = { (state: NWListener.State) in
+    switch state {
+    case .ready:
+        print("rime-translate-helper listening on 127.0.0.1:\(port), db=\(dbPath)")
+    case .failed(let err):
+        fputs("listener failed: \(err)\n", stderr)
+        exit(1)
+    default: break
+    }
+}
+listener.start(queue: .main)
 
-// async request pipeline: drain user-typed misses every second
-let drainTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-drainTimer.schedule(deadline: .now() + 1, repeating: 1)
-drainTimer.setEventHandler { drainRequests(dict, hotDirty: hotDirty) }
-drainTimer.resume()
+// background startup work: initial export + request drain loop
+Task.detached(priority: .utility) {
+    doExportHotCache(dict)
+}
+_ = drainLoop(dict)
 
 let flushTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
 flushTimer.schedule(deadline: .now() + 5, repeating: 5)
-flushTimer.setEventHandler { if hotDirty.take() { exportHotCache(dict) } }
+flushTimer.setEventHandler { if hotDirty.take() { doExportHotCache(dict) } }
 flushTimer.resume()
 
 let configFD = open(configPath, O_EVTONLY)
@@ -457,30 +520,5 @@ if configFD >= 0 {
 
 signal(SIGINT) { _ in exit(0) }
 signal(SIGTERM) { _ in exit(0) }
-
-let params = NWParameters.tcp
-params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
-let listener = try NWListener(using: params)
-listener.newConnectionHandler = { conn in
-    conn.start(queue: .global(qos: .userInitiated))
-    conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, error in
-        if let data = data, error == nil {
-            handleRequest(data, dict: dict, pending: pending, hotDirty: hotDirty, conn: conn)
-        } else {
-            conn.cancel()
-        }
-    }
-}
-listener.stateUpdateHandler = { state in
-    switch state {
-    case .ready:
-        print("rime-translate-helper listening on 127.0.0.1:\(port), db=\(dbPath)")
-    case .failed(let err):
-        fputs("listener failed: \(err)\n", stderr)
-        exit(1)
-    default: break
-    }
-}
-listener.start(queue: .main)
 
 dispatchMain()
