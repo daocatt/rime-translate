@@ -83,18 +83,26 @@ local function scan_yaml_value(path, key_pattern)
     return content:match(key_pattern)
 end
 
--- detect Squirrel horizontal/vertical layout
+-- detect Squirrel horizontal/vertical layout from user theme config
 local function detect_orientation()
     if cfg.orientation == "horizontal" or cfg.orientation == "vertical" then
         return cfg.orientation
     end
     local home = os.getenv("HOME") or ""
-    local candidates = {
+    local files = {
         home .. "/Library/Rime/squirrel.custom.yaml",
         "/Library/Input Methods/Squirrel.app/Contents/SharedSupport/squirrel.yaml",
     }
-    for _, p in ipairs(candidates) do
-        local v = scan_yaml_value(p, "horizontal:%s*(%a+)%s*$")
+    -- modern themes: candidate_list_layout (linear=horizontal, stacked=vertical)
+    for _, p in ipairs(files) do
+        local v = scan_yaml_value(p, "candidate_list_layout:%s*(%a+)%s*$")
+        if v == "linear" then return "horizontal" end
+        if v == "stacked" then return "vertical" end
+        v = scan_yaml_value(p, "text_orientation:%s*(%a+)%s*$")
+        if v == "horizontal" then return "horizontal" end
+        if v == "vertical" then return "vertical" end
+        -- legacy key
+        v = scan_yaml_value(p, "^%s*horizontal:%s*(%a+)%s*$")
         if v == "true" then return "horizontal" end
         if v == "false" then return "vertical" end
     end
