@@ -18,6 +18,12 @@ Candidate = {}
 function Candidate.new(text, cmt, ctype)
     return { text = text, comment = cmt or "", type = ctype or "table" }
 end
+-- emulate librime-lua's constructor: Candidate(type, start, end_, text, comment)
+setmetatable(Candidate, {
+    __call = function(_, t, s, e, text, cmt)
+        return { text = text, comment = cmt or "", type = t, start = s, _end = e }
+    end,
+})
 
 -- fake helper responses keyed by query
 HelperResponses = {
@@ -107,3 +113,9 @@ run_case("non-CJK untouched", {
 run_case("unknown word -> no comment, still yielded", {
     Candidate.new("未知词"),
 }, { "未知词|" })
+
+-- shadow candidate replacement path
+ShadowCandidate = Candidate
+run_case("shadow candidate gets replaced with comment", {
+    Candidate.new("苹果", "", "simplified"),
+}, { "苹果|  apple" })

@@ -34,6 +34,26 @@ local DEFAULTS = {
     max_candidate_len = 12,
 }
 
+-- debug tracing to /tmp/rime_translate_debug.log (set env
+-- RIME_TRANSLATE_DEBUG=0 in launchd/plist to disable; on by default)
+local dbg = nil
+local function trace(fmt, ...)
+    if not dbg then return end
+    local ok, msg = pcall(string.format, fmt, ...)
+    if not ok then msg = "?" end
+    pcall(dbg.write, dbg, os.date("%H:%M:%S ") .. msg .. "\n")
+    pcall(dbg.flush, dbg)
+end
+
+local function open_debug()
+    local f = io.open("/tmp/rime_translate_debug.log", "a")
+    if not f then return end
+    dbg = f
+    trace("=== session start, lua=%s popen=%s ===",
+        _VERSION and tostring(_VERSION) or "?",
+        type(io.popen))
+end
+
 local M = {}
 
 local cfg = {}
@@ -41,6 +61,8 @@ local mem_cache = {}      -- zh -> en string (pipe separated)
 local neg_cache = {}      -- zh -> true, known to have no translation
 local hot_mtime_checked = 0
 local hot_cache = {}
+local quota_second = 0    -- helper-spawn rate limiting (see query_helper)
+local quota_used = 0
 
 --------------------------------------------------------------------
 -- helpers
@@ -121,20 +143,29 @@ local function load_hot_cache(force)
     local home = os.getenv("HOME") or ""
     local path = home .. "/Library/Rime/rime_translate_cache.tsv"
     local mt = file_mtime(path)
-    if mt == nil then return end
+    if mt == nil then
+        trace("hot cache: stat failed for %s", path)
+        return
+    end
     if hot_cache._mtime == mt and not force then return end
 
     local new_cache = { _mtime = mt }
     local count = 0
-    for line in io.lines(path) do
-        local zh, en = line:match("^(.-)\t(.+)$")
-        if zh and en and en ~= "" then
-            new_cache[zh] = en
-            count = count + 1
+    local ok, err = pcall(function()
+        for line in io.lines(path) do
+            local zh, en = line:match("^(.-)\t(.+)$")
+            if zh and en and en ~= "" then
+                new_cache[zh] = en
+                count = count + 1
+            end
         end
+    end)
+    if not ok then
+        trace("hot cache load ERROR: %s", tostring(err))
+        return
     end
     hot_cache = new_cache
-    log.info(string.format("rime_translate: loaded %d hot cache entries", count))
+    trace("hot cache loaded: %d entries (mtime=%s)", count, tostring(mt))
 end
 
 local function is_cjk(text)
@@ -168,20 +199,45 @@ local function url_encode(s)
 end
 
 local function query_helper(zh)
+    if type(io.popen) ~= "function" then return nil end
+    -- rate limit: at most 2 helper spawns per second, typing responsiveness
+    -- beats completeness (missed words are retried next session)
+    local now = os.time()
+    if now == quota_second then
+        if quota_used >= 2 then
+            trace("rate-limited: %s", zh)
+            return nil
+        end
+        quota_used = quota_used + 1
+    else
+        quota_second = now
+        quota_used = 1
+    end
     local url = string.format(
         "http://127.0.0.1:%d/lookup?q=%s",
         cfg.helper_port, url_encode(zh))
-    local f = io.popen("/usr/bin/curl -s --max-time 0.15 '" .. url .. "' 2>/dev/null")
-    if not f then return nil end
-    local body = f:read("*a")
-    f:close()
+    local ok, body = pcall(function()
+        local f = io.popen("/usr/bin/curl -s --max-time 0.15 '" .. url .. "' 2>/dev/null")
+        if not f then return nil end
+        local b = f:read("*a")
+        f:close()
+        return b
+    end)
+    if not ok then
+        trace("curl ERROR: %s", tostring(body))
+        return nil
+    end
     -- {"q":"..","en":"..","source":"dict"}  -- minimal json field grab
-    local en = body:match('"en":"(.-)","source"')
-    if en == nil or en == "" then return nil end
+    local en = body and body:match('"en":"(.-)","source"') or nil
+    if en == nil or en == "" then
+        trace("helper miss: %s", zh)
+        return nil
+    end
     en = en:gsub('\\"', '"'):gsub("\\\\", "\\")
     en = en:gsub("\\u([0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])", function(hex)
         return utf8.char(tonumber(hex, 16))
     end)
+    trace("helper hit: %s -> %s", zh, en:sub(1, 40))
     return en
 end
 
@@ -210,6 +266,7 @@ local function lookup(zh)
     hit = hot_cache[zh]
     if hit then
         mem_cache[zh] = hit
+        trace("hot hit: %s", zh)
         return hit
     end
     hit = query_helper(zh)
@@ -219,6 +276,7 @@ local function lookup(zh)
     end
     neg_cache[zh] = true
     mem_cache[zh] = false
+    trace("neg-cached: %s", zh)
     return nil
 end
 
@@ -227,8 +285,12 @@ end
 --------------------------------------------------------------------
 
 function M.init(env)
-    load_config(env)
-    load_hot_cache(true)
+    local ok, err = pcall(function()
+        open_debug()
+        load_config(env)
+        load_hot_cache(true)
+    end)
+    if not ok then trace("init ERROR: %s", tostring(err)) end
 end
 
 function M.fini(env) end
@@ -240,7 +302,25 @@ function M.func(input, env)
             if ok and en then
                 local rendered = render(en)
                 if rendered then
-                    cand.comment = (cand.comment or "") .. "  " .. rendered
+                    -- shadow candidates created by the simplifier do not
+                    -- render comments assigned afterwards; replace them
+                    -- with an equivalent plain candidate instead
+                    if cand.type == "simplified" or cand.type == "shadow" then
+                        local ok2, err2 = pcall(function()
+                            local repl = Candidate("simplified", cand.start,
+                                cand._end, cand.text, "  " .. rendered)
+                            repl.quality = cand.quality
+                            yield(repl)
+                        end)
+                        if not ok2 then
+                            trace("replace FAILED (%s): %s", cand.text, tostring(err2))
+                        else
+                            trace("replaced: %s [%s]", cand.text, rendered)
+                        end
+                    else
+                        cand.comment = (cand.comment or "") .. "  " .. rendered
+                        trace("annotated: %s [%s] type=%s", cand.text, rendered, cand.type)
+                    end
                 end
             end
         end
