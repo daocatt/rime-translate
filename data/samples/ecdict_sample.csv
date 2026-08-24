@@ -1,0 +1,11 @@
+word,phonetic,definition,translation,pos,collins,oxford,tag,bnc,frq,exchange,detail,audio
+apple,apl,"an apple a day keeps the doctor away","n. 苹果；果实",n,3,1,kd:4k,1200,54321,d/dogs:0","",apple.wav
+code,kod,"a system of words or symbols",n. 代码；编码；法典,na,5,1,kd:10k fr:2,900,48222,d/codes:0","",code.wav
+program,prougram,"a set of instructions",n. 程序；计划；节目,na,5,1,kd:10k fr:2,800,45111,d/programs:0","",program.wav
+fruit,frut,"the sweet product of a plant",n. 水果；果实,n,3,1,kd:5k,1500,40000,d/fruit:0"",fruit.wav
+computer,kmpjut,"a machine that can be programmed",n. 计算机；电脑,na,4,1,kd:10k fr:3,1000,38000,s:computers,computer.wav
+artificial intelligence,,,n. 人工智能；人工智慧,,,,i:20000,5000,30000,,,
+machine learning,,,n. 机器学习,,,,i:25000,4500,28000,,,
+xylophone,zailfun,"a musical instrument",n. 木琴,n,0,0,,0,0,s:xylophones,,xylophone.wav
+run,rn,"move fast on foot",vt. 跑；运行；经营,vi vt,5,1,kd:20k fr:5,300,99000,d/running:0"",run.wav
+beautiful,bjutfl,"pleasing to the eye",adj. 美丽的；漂亮的,a,5,1,kd:10k fr:4,600,70000,r/beautifuler:0"",beautiful.wav

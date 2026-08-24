@@ -1,0 +1,388 @@
+// rime-translate-helper
+//
+// Local companion daemon for the rime-translate Rime plugin.
+//  - serves GET /lookup?q=<chinese>  on 127.0.0.1 (offline SQLite first,
+//    Cloudflare Workers AI as async fallback)
+//  - exports a "hot cache" TSV consumed by the lua filter so the common
+//    path needs no IPC at all
+//
+// Data layout under ~/Library/Application Support/rime-translate/:
+//   ecdict.db     offline dictionary (built by scripts/build_dict.py)
+//   config.json   {"account_id": "...", "api_token": "...", "model": "..."}
+// Hot cache: ~/Library/Rime/rime_translate_cache.tsv
+
+import Foundation
+import Network
+import SQLite3
+
+let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+let defaultModel = "@cf/meta/m2m100-1.2B"
+let hotCacheTopN = 30000
+
+func appSupportDir() -> URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    return base.appendingPathComponent("rime-translate", isDirectory: true)
+}
+
+func rimeDir() -> URL {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    return home.appendingPathComponent("Library/Rime", isDirectory: true)
+}
+
+struct AIConfig {
+    var accountID = ""
+    var apiToken = ""
+    var model = defaultModel
+
+    static func load(_ url: URL) -> AIConfig? {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = obj["account_id"] as? String, !id.isEmpty,
+              let token = obj["api_token"] as? String, !token.isEmpty
+        else { return nil }
+        var c = AIConfig()
+        c.accountID = id
+        c.apiToken = token
+        if let m = obj["model"] as? String, !m.isEmpty { c.model = m }
+        return c
+    }
+}
+
+final class Dict {
+    private var db: OpaquePointer?
+    private let queue = DispatchQueue(label: "rime-translate.dict")
+    private(set) var aiConfig: AIConfig?
+
+    init(path: String, configURL: URL) throws {
+        if sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) != SQLITE_OK {
+            throw NSError(domain: "dict", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "cannot open \(path)"])
+        }
+        queue.sync {
+            sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+            sqlite3_exec(db, """
+                CREATE TABLE IF NOT EXISTS zh_en (
+                    zh TEXT PRIMARY KEY, en TEXT NOT NULL, score REAL NOT NULL DEFAULT 0
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS ai_cache (
+                    zh TEXT PRIMARY KEY, en TEXT NOT NULL, created_at INTEGER NOT NULL
+                );
+                """, nil, nil, nil)
+        }
+        reloadConfig(configURL)
+    }
+
+    func reloadConfig(_ url: URL) {
+        queue.async { self.aiConfig = AIConfig.load(url) }
+    }
+
+    private func query(_ sql: String, bind zh: String) -> String? {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer {}
+        sqlite3_bind_text(stmt, 1, zh, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return String(cString: sqlite3_column_text(stmt, 0))
+    }
+
+    func lookupDict(_ zh: String) -> String? {
+        queue.sync { query("SELECT en FROM zh_en WHERE zh = ?1", bind: zh) }
+    }
+
+    func lookupCache(_ zh: String) -> String? {
+        queue.sync { query("SELECT en FROM ai_cache WHERE zh = ?1", bind: zh) }
+    }
+
+    func insertCache(_ zh: String, _ en: String) {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "INSERT OR REPLACE INTO ai_cache VALUES (?1, ?2, ?3)"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, zh, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, en, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(stmt, 3, Int64(Date().timeIntervalSince1970))
+            _ = sqlite3_step(stmt)
+        }
+    }
+
+    /// Top phrases by score for the hot cache file.
+    func topPhrases(_ n: Int) -> [(zh: String, en: String)] {
+        queue.sync {
+            var out: [(String, String)] = []
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT zh, en FROM zh_en ORDER BY score DESC LIMIT ?1"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+            sqlite3_bind_int(stmt, 1, Int32(n))
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                            String(cString: sqlite3_column_text(stmt, 1))))
+            }
+            return out
+        }
+    }
+
+    func allCached() -> [(zh: String, en: String)] {
+        queue.sync {
+            var out: [(String, String)] = []
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "SELECT zh, en FROM ai_cache", -1, &stmt, nil) == SQLITE_OK else { return [] }
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                            String(cString: sqlite3_column_text(stmt, 1))))
+            }
+            return out
+        }
+    }
+}
+
+// MARK: - Cloudflare Workers AI
+
+func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
+    let urlStr = "https://api.cloudflare.com/client/v4/accounts/\(cfg.accountID)/ai/run/\(cfg.model)"
+    guard let url = URL(string: urlStr) else { return nil }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("Bearer \(cfg.apiToken)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 15
+    let body: [String: Any] = ["text": text, "source_lang": "chinese", "target_lang": "english"]
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+    guard let (data, resp) = try? await URLSession.shared.data(for: req),
+          (resp as? HTTPURLResponse)?.statusCode == 200,
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          (obj["success"] as? Bool) != false,
+          let result = obj["result"]
+    else { return nil }
+
+    // translation models -> [{"translated_text": "..."}]; instruct models -> {"response": "..."}
+    if let arr = result as? [[String: Any]] {
+        let parts = arr.compactMap { $0["translated_text"] as? String }
+        let joined = parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
+    }
+    if let dict = result as? [String: Any], let r = dict["response"] as? String {
+        let t = r.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+    return nil
+}
+
+// MARK: - Hot cache export
+
+func exportHotCache(_ dict: Dict) {
+    let dir = rimeDir()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let tmp = dir.appendingPathComponent(".rime_translate_cache.tsv.tmp")
+    let dst = dir.appendingPathComponent("rime_translate_cache.tsv")
+
+    var lines: [String] = []
+    for p in dict.topPhrases(hotCacheTopN) where !p.zh.contains("\t") && !p.en.contains("\t") {
+        lines.append("\(p.zh)\t\(p.en)")
+    }
+    for p in dict.allCached() where !p.zh.contains("\t") && !p.en.contains("\t") {
+        lines.append("\(p.zh)\t\(p.en)")
+    }
+    let payload = lines.joined(separator: "\n") + "\n"
+    if (try? payload.write(to: tmp, atomically: true, encoding: .utf8)) != nil {
+        _ = try? FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+    }
+}
+
+// MARK: - HTTP server
+
+func percentDecode(_ s: String) -> String {
+    s.removingPercentEncoding ?? s
+}
+
+func jsonResponse(_ conn: NWConnection, code: Int, body: String) {
+    let reason = code == 200 ? "OK" : (code == 400 ? "Bad Request" : "Not Found")
+    let head = "HTTP/1.1 \(code) \(reason)\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+    conn.send(content: Data((head + body).utf8), completion: .contentProcessed { _ in
+        conn.cancel()
+    })
+}
+
+func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, hotDirty: HotDirty, conn: NWConnection) {
+    guard let req = String(data: data, encoding: .utf8),
+          let firstLine = req.split(separator: "\r\n", maxSplits: 1).first else {
+        return jsonResponse(conn, code: 400, body: "{}")
+    }
+    let parts = firstLine.split(separator: " ")
+    guard parts.count >= 2 else { return jsonResponse(conn, code: 400, body: "{}") }
+    let target = String(parts[1])
+    let path = target.split(separator: "?", maxSplits: 1).map(String.init)[0]
+
+    switch path {
+    case "/health":
+        let hasDict = dict.lookupDict("苹果") != nil || dict.topPhrases(1).count > 0
+        let ai = dict.aiConfig != nil
+        return jsonResponse(conn, code: 200,
+            body: "{\"status\":\"ok\",\"dict\":\(hasDict),\"ai\":\(ai)}")
+
+    case "/lookup":
+        guard let qStart = target.range(of: "?q=") else {
+            return jsonResponse(conn, code: 400, body: "{\"error\":\"missing q\"}")
+        }
+        let raw = String(target[qStart.upperBound...])
+        let q = percentDecode(raw.split(separator: "&").map(String.init)[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, q.utf8.count <= 120 else {
+            return jsonResponse(conn, code: 200, body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\",\"source\":\"none\"}")
+        }
+
+        if let cached = dict.lookupCache(q) {
+            return jsonResponse(conn, code: 200,
+                body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\(escapeJSON(cached))\",\"source\":\"ai\"}")
+        }
+        if let en = dict.lookupDict(q) {
+            return jsonResponse(conn, code: 200,
+                body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\(escapeJSON(en))\",\"source\":\"dict\"}")
+        }
+        maybeTranslate(q, dict: dict, pending: pending, hotDirty: hotDirty)
+        return jsonResponse(conn, code: 200,
+            body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\",\"source\":\"pending\"}")
+
+    default:
+        return jsonResponse(conn, code: 404, body: "{\"error\":\"not found\"}")
+    }
+}
+
+func escapeJSON(_ s: String) -> String {
+    var out = ""
+    for c in s.unicodeScalars {
+        switch c {
+        case "\"": out += "\\\""
+        case "\\": out += "\\\\"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        case "\t": out += "\\t"
+        default:
+            if c.value < 0x20 { out += String(format: "\\u%04x", c.value) }
+            else { out.unicodeScalars.append(c) }
+        }
+    }
+    return out
+}
+
+/// Avoids hammering the AI endpoint for words nobody re-checks.
+final class NegativeCache {
+    private var seen: Set<String> = []
+    private let lock = NSLock()
+    func mark(_ w: String) {
+        lock.lock(); seen.insert(w); lock.unlock()
+    }
+    func contains(_ w: String) -> Bool {
+        lock.lock(); let v = seen.contains(w); lock.unlock()
+        return v
+    }
+}
+
+final class HotDirty {
+    private let lock = NSLock()
+    private var dirty = false
+    func mark() {
+        lock.lock(); dirty = true; lock.unlock()
+    }
+    func take() -> Bool {
+        lock.lock(); let d = dirty; dirty = false; lock.unlock()
+        return d
+    }
+}
+
+func maybeTranslate(_ q: String, dict: Dict, pending: NegativeCache, hotDirty: HotDirty) {
+    guard let cfg = dict.aiConfig, !pending.contains(q) else { return }
+    pending.mark(q)
+    Task.detached(priority: .utility) {
+        guard let en = await translateWithAI(q, cfg: cfg) else { return }
+        dict.insertCache(q, en)
+        hotDirty.mark()
+    }
+}
+
+// MARK: - main
+
+var dbPath = appSupportDir().appendingPathComponent("ecdict.db").path
+var port: UInt16 = 61899
+var configPath = appSupportDir().appendingPathComponent("config.json").path
+
+var args = Array(CommandLine.arguments.dropFirst())
+while !args.isEmpty {
+    switch args[0] {
+    case "--db": dbPath = args[1]; args.removeFirst(2)
+    case "--port": port = UInt16(args[1]) ?? port; args.removeFirst(2)
+    case "--config": configPath = args[1]; args.removeFirst(2)
+    default: args.removeFirst()
+    }
+}
+
+try? FileManager.default.createDirectory(atPath: appSupportDir().path, withIntermediateDirectories: true)
+
+let configURL = URL(fileURLWithPath: configPath)
+let dict: Dict
+do {
+    dict = try Dict(path: dbPath, configURL: configURL)
+} catch {
+    fputs("fatal: \(error.localizedDescription)\n", stderr)
+    exit(1)
+}
+if dict.aiConfig == nil {
+    fputs("note: no AI config at \(configPath); running offline-only\n", stderr)
+}
+if dict.topPhrases(1).isEmpty {
+    fputs("warning: dictionary appears empty (\(dbPath))\n", stderr)
+}
+
+let pending = NegativeCache()
+let hotDirty = HotDirty()
+
+exportHotCache(dict)
+
+let flushTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+flushTimer.schedule(deadline: .now() + 5, repeating: 5)
+flushTimer.setEventHandler { if hotDirty.take() { exportHotCache(dict) } }
+flushTimer.resume()
+
+let configFD = open(configPath, O_EVTONLY)
+if configFD >= 0 {
+    let configWatch = DispatchSource.makeFileSystemObjectSource(
+        fileDescriptor: configFD,
+        eventMask: [.write, .delete],
+        queue: .global(qos: .utility))
+    configWatch.setEventHandler { dict.reloadConfig(configURL) }
+    configWatch.resume()
+}
+
+signal(SIGINT) { _ in exit(0) }
+signal(SIGTERM) { _ in exit(0) }
+
+let params = NWParameters.tcp
+params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
+let listener = try NWListener(using: params)
+listener.newConnectionHandler = { conn in
+    conn.start(queue: .global(qos: .userInitiated))
+    conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, error in
+        if let data = data, error == nil {
+            handleRequest(data, dict: dict, pending: pending, hotDirty: hotDirty, conn: conn)
+        } else {
+            conn.cancel()
+        }
+    }
+}
+listener.stateUpdateHandler = { state in
+    switch state {
+    case .ready:
+        print("rime-translate-helper listening on 127.0.0.1:\(port), db=\(dbPath)")
+    case .failed(let err):
+        fputs("listener failed: \(err)\n", stderr)
+        exit(1)
+    default: break
+    }
+}
+listener.start(queue: .main)
+
+dispatchMain()

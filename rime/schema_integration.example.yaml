@@ -1,0 +1,7 @@
+# 接入示例：在输入方案（如 luna_pinyin.custom.yaml）中加入：
+#
+# patch:
+#   engine/filters/+:
+#     - lua_filter@*rime_translate
+#
+# 并把 rime_translate.lua 放到 ~/Library/Rime/lua/ 目录。

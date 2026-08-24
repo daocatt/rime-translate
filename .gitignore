@@ -1,0 +1,4 @@
+.DS_Store
+dist/*.db
+*.o
+nohup.out

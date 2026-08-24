@@ -1,0 +1,16 @@
+# rime-translate 配置示例
+# 复制到 ~/Library/Rime/rime_translate.custom.yaml 后按需修改，然后「重新部署」。
+
+patch:
+  translate/enabled: true
+  # 横向候选（style/horizontal: true）时最多显示几个英文词
+  translate/max_entries_horizontal: 2
+  # 竖向候选时最多显示几个英文词
+  translate/max_entries_vertical: 5
+  translate/separator: " / "
+  # 横竖排检测：auto=读 Squirrel 设置；也可强制 horizontal / vertical
+  translate/orientation_override: auto
+  # helper 监听端口（与 LaunchAgent 保持一致）
+  translate/helper_port: 61899
+  # 超过该字数的中文候选不做翻译
+  translate/max_candidate_len: 12
