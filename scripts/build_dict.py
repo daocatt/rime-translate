@@ -56,6 +56,18 @@ def load_evidenced_words(path):
 
 
 CEDICT_LINE = re.compile(r"^\S+ (\S+) \[[^\]]*\] /(.+)/\s*$")
+# cross-reference fragments ("used in 自個兒", "variant of 個", pinyin
+# citations "zi4 ge3 r5") are pointers, not translations
+HAS_CJK = re.compile(r"[\u3400-\u9fff]")
+PINYIN_CITE = re.compile(r"[a-z]+[1-5](\s|$)")
+
+
+def cedict_def_ok(seg):
+    if HAS_CJK.search(seg):
+        return False
+    if PINYIN_CITE.search(seg.lower()):
+        return False
+    return True
 
 
 def parse_cedict(path):
@@ -76,6 +88,8 @@ def parse_cedict(path):
             for seg in defs_raw.split("/"):
                 seg = seg.strip()
                 if not seg or seg.startswith("CL:") or seg.startswith("see "):
+                    continue
+                if not cedict_def_ok(seg):
                     continue
                 if seg not in defs:
                     defs.append(seg)
