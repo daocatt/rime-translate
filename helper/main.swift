@@ -200,6 +200,12 @@ func isCommonCJK(_ s: String) -> Bool {
     return s.unicodeScalars.allSatisfy { ($0.value >= 0x4E00 && $0.value <= 0x9FA5) }
 }
 
+func truncated(_ en: String) -> String {
+    // lua renders at most max_entries_vertical (5); keep a small margin
+    let parts = en.split(separator: "|", maxSplits: 7)
+    return parts.joined(separator: "|")
+}
+
 func exportHotCache(_ dict: Dict) {
     let dir = rimeDir()
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -207,11 +213,7 @@ func exportHotCache(_ dict: Dict) {
     let dst = dir.appendingPathComponent("rime_translate_cache.tsv")
 
     var lines: [String] = []
-    func truncated(_ en: String) -> String {
-        // lua renders at most max_entries_vertical (5); keep a small margin
-        let parts = en.split(separator: "|", maxSplits: 7)
-        return parts.joined(separator: "|")
-    }
+    lines.append("#rev=\(Int(Date().timeIntervalSince1970 * 1000))")
     for p in dict.topPhrases(hotCacheTopN * 3) {
         guard !p.zh.contains("\t"), !p.en.contains("\t"),
               p.zh.utf8.count <= 48, isCommonCJK(p.zh) else { continue }
@@ -224,6 +226,56 @@ func exportHotCache(_ dict: Dict) {
     let payload = lines.joined(separator: "\n") + "\n"
     if (try? payload.write(to: tmp, atomically: true, encoding: .utf8)) != nil {
         _ = try? FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+    }
+}
+
+// MARK: - async request pipeline
+//
+// The lua filter never spawns processes while typing: on a hot-cache miss it
+// just appends the word to rime_translate_requests.txt (a plain file append).
+// This timer drains that file every second -- answering from SQLite or
+// Cloudflare AI -- then re-exports the hot cache with a bumped #rev header
+// that the filter notices cheaply (reads one line) and reloads.
+
+let requestsURL = rimeDir().appendingPathComponent("rime_translate_requests.txt")
+var attempted = Set<String>()
+let attemptedLock = NSLock()
+
+func drainRequests(_ dict: Dict, hotDirty: HotDirty) {
+    guard let raw = try? String(contentsOf: requestsURL, encoding: .utf8),
+          !raw.isEmpty else { return }
+    try? "".write(to: requestsURL, atomically: true, encoding: .utf8)
+
+    var added = false
+    for word in raw.split(separator: "\n") {
+        let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
+        attemptedLock.lock()
+        let seen = attempted.contains(zh)
+        attemptedLock.unlock()
+        if seen { continue }
+
+        var resolved = false
+        if dict.lookupDict(zh) != nil || dict.lookupCache(zh) != nil {
+            resolved = true
+        } else if let cfg = dict.aiConfig {
+            attemptedLock.lock(); attempted.insert(zh); attemptedLock.unlock()
+            let sem = DispatchSemaphore(value: 0)
+            Task.detached(priority: .utility) {
+                if let en = await translateWithAI(zh, cfg: cfg) {
+                    dict.insertCache(zh, en)
+                }
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 15)
+            resolved = true
+        }
+        if resolved { added = true }
+    }
+    if added {
+        exportHotCache(dict)
+        NSLog("drained %d request(s)", raw.split(separator: "\n").count)
+        _ = hotDirty
     }
 }
 
@@ -374,6 +426,12 @@ let pending = NegativeCache()
 let hotDirty = HotDirty()
 
 exportHotCache(dict)
+
+// async request pipeline: drain user-typed misses every second
+let drainTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+drainTimer.schedule(deadline: .now() + 1, repeating: 1)
+drainTimer.setEventHandler { drainRequests(dict, hotDirty: hotDirty) }
+drainTimer.resume()
 
 let flushTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
 flushTimer.schedule(deadline: .now() + 5, repeating: 5)

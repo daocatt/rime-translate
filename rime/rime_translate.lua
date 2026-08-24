@@ -3,12 +3,14 @@
 -- RIME (librime-lua) filter that annotates Chinese candidates with English
 -- translations from the rime-translate offline dictionary (ECDICT, MIT).
 --
--- Data sources, in order:
+-- Data sources:
 --   1. in-memory session cache
 --   2. hot cache TSV exported by rime-translate-helper
---      (~/Library/Rime/rime_translate_cache.tsv, reloaded on mtime change)
---   3. one-shot local HTTP call to the helper (127.0.0.1), which answers
---      from SQLite instantly and kicks off Cloudflare Workers AI for misses
+--      (~/Library/Rime/rime_translate_cache.tsv, reloaded when its #rev
+--       header changes -- checking it reads one line, never spawns a process)
+--   3. misses are appended to rime_translate_requests.txt; the helper drains
+--      that file every second (SQLite / Cloudflare Workers AI) and refills
+--      the hot cache. Typing is NEVER blocked by network or subprocesses.
 --
 -- Configuration (~/Library/Rime/rime_translate.custom.yaml):
 --
@@ -57,12 +59,10 @@ end
 local M = {}
 
 local cfg = {}
-local mem_cache = {}      -- zh -> en string (pipe separated)
-local neg_cache = {}      -- zh -> true, known to have no translation
-local hot_mtime_checked = 0
-local hot_cache = {}
-local quota_second = 0    -- helper-spawn rate limiting (see query_helper)
-local quota_used = 0
+local mem_cache = {}      -- zh -> en string (pipe separated); false = pending
+local neg_cache = {}      -- kept for compatibility; unused since async mode
+local hot_cache = {}      -- _rev = version from helper
+local requested = {}      -- words already written to the request file
 
 --------------------------------------------------------------------
 -- helpers
@@ -74,14 +74,6 @@ local function read_file(path)
     local content = f:read("*a")
     f:close()
     return content
-end
-
-local function file_mtime(path)
-    local f = io.popen("/usr/bin/stat -f %m '" .. path:gsub("'", "'\\''") .. "' 2>/dev/null")
-    if not f then return nil end
-    local v = f:read("*l")
-    f:close()
-    return tonumber(v)
 end
 
 -- naive scan of "key: value" lines in yaml-ish files
@@ -135,37 +127,63 @@ local function load_config(env)
     cfg.layout = detect_orientation()
 end
 
-local function load_hot_cache(force)
-    local now = os.time()
-    if not force and (now - hot_mtime_checked) < 3 then return end
-    hot_mtime_checked = now
+-- cheap freshness check: read only the "#rev=" header line (no subprocess)
+local function cache_rev()
+    local home = os.getenv("HOME") or ""
+    local f = io.open(home .. "/Library/Rime/rime_translate_cache.tsv", "rb")
+    if not f then return nil end
+    local head = f:read(40) or ""
+    f:close()
+    return tonumber(head:match("#rev=(%d+)"))
+end
+
+local function load_hot_cache()
+    local rev = cache_rev()
+    if rev == nil then
+        trace("hot cache: unreadable or missing")
+        return false
+    end
+    if hot_cache._rev == rev then return false end
 
     local home = os.getenv("HOME") or ""
     local path = home .. "/Library/Rime/rime_translate_cache.tsv"
-    local mt = file_mtime(path)
-    if mt == nil then
-        trace("hot cache: stat failed for %s", path)
-        return
-    end
-    if hot_cache._mtime == mt and not force then return end
-
-    local new_cache = { _mtime = mt }
+    local new_cache = { _rev = rev }
     local count = 0
     local ok, err = pcall(function()
         for line in io.lines(path) do
-            local zh, en = line:match("^(.-)\t(.+)$")
-            if zh and en and en ~= "" then
-                new_cache[zh] = en
-                count = count + 1
+            if not line:match("^#") then
+                local zh, en = line:match("^(.-)\t(.+)$")
+                if zh and en and en ~= "" then
+                    new_cache[zh] = en
+                    count = count + 1
+                end
             end
         end
     end)
     if not ok then
         trace("hot cache load ERROR: %s", tostring(err))
-        return
+        return false
     end
     hot_cache = new_cache
-    trace("hot cache loaded: %d entries (mtime=%s)", count, tostring(mt))
+    -- entries may have been filled: retry everything pending this session
+    mem_cache = {}
+    neg_cache = {}
+    requested = {}
+    trace("hot cache loaded: %d entries (rev=%s)", count, tostring(rev))
+    return true
+end
+
+-- fire-and-forget miss reporting: a plain file append, never blocks.
+-- The helper drains this file each second and refills the hot cache.
+local function request_word(zh)
+    if requested[zh] then return end
+    requested[zh] = true
+    local home = os.getenv("HOME") or ""
+    local f = io.open(home .. "/Library/Rime/rime_translate_requests.txt", "a")
+    if not f then return end
+    f:write(zh, "\n")
+    f:close()
+    trace("requested: %s", zh)
 end
 
 local function is_cjk(text)
@@ -181,64 +199,6 @@ local function is_cjk(text)
         end
     end)
     return ok and n > 0
-end
-
-local function url_encode(s)
-    local out = {}
-    for i = 1, #s do
-        local b = s:byte(i)
-        if b == 0x20 then out[#out + 1] = "%20"
-        elseif (b >= 0x30 and b <= 0x39) or (b >= 0x41 and b <= 0x5a)
-            or (b >= 0x61 and b <= 0x7a) or b == 0x2d or b == 0x5f then
-            out[#out + 1] = string.char(b)
-        else
-            out[#out + 1] = string.format("%%%02X", b)
-        end
-    end
-    return table.concat(out)
-end
-
-local function query_helper(zh)
-    if type(io.popen) ~= "function" then return nil end
-    -- rate limit: at most 2 helper spawns per second, typing responsiveness
-    -- beats completeness (missed words are retried next session)
-    local now = os.time()
-    if now == quota_second then
-        if quota_used >= 2 then
-            trace("rate-limited: %s", zh)
-            return nil
-        end
-        quota_used = quota_used + 1
-    else
-        quota_second = now
-        quota_used = 1
-    end
-    local url = string.format(
-        "http://127.0.0.1:%d/lookup?q=%s",
-        cfg.helper_port, url_encode(zh))
-    local ok, body = pcall(function()
-        local f = io.popen("/usr/bin/curl -s --max-time 0.15 '" .. url .. "' 2>/dev/null")
-        if not f then return nil end
-        local b = f:read("*a")
-        f:close()
-        return b
-    end)
-    if not ok then
-        trace("curl ERROR: %s", tostring(body))
-        return nil
-    end
-    -- {"q":"..","en":"..","source":"dict"}  -- minimal json field grab
-    local en = body and body:match('"en":"(.-)","source"') or nil
-    if en == nil or en == "" then
-        trace("helper miss: %s", zh)
-        return nil
-    end
-    en = en:gsub('\\"', '"'):gsub("\\\\", "\\")
-    en = en:gsub("\\u([0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])", function(hex)
-        return utf8.char(tonumber(hex, 16))
-    end)
-    trace("helper hit: %s -> %s", zh, en:sub(1, 40))
-    return en
 end
 
 -- pick first N english words out of "w1|w2|w3|..." joined by separator
@@ -262,21 +222,22 @@ local function lookup(zh)
     if hit ~= nil then
         return hit == false and nil or hit
     end
-    load_hot_cache(false)
     hit = hot_cache[zh]
     if hit then
         mem_cache[zh] = hit
-        trace("hot hit: %s", zh)
         return hit
     end
-    hit = query_helper(zh)
+    -- miss: ask the helper asynchronously (file append, zero blocking);
+    -- a few keystrokes later the refilled hot cache answers on its own
+    load_hot_cache()
+    hit = hot_cache[zh]
     if hit then
         mem_cache[zh] = hit
+        trace("hot hit (after reload): %s", zh)
         return hit
     end
-    neg_cache[zh] = true
+    request_word(zh)
     mem_cache[zh] = false
-    trace("neg-cached: %s", zh)
     return nil
 end
 
@@ -288,7 +249,7 @@ function M.init(env)
     local ok, err = pcall(function()
         open_debug()
         load_config(env)
-        load_hot_cache(true)
+        load_hot_cache()
     end)
     if not ok then trace("init ERROR: %s", tostring(err)) end
 end
