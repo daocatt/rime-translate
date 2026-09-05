@@ -93,17 +93,19 @@ if layout == "horizontal" then
         Candidate.new("跑"),
     }, { "跑|  run / operate" })
 else
-    run_case("offline hit via hot cache", {
-        Candidate.new("苹果"),
-    }, { "苹果|  apple" })
+    if not os.getenv("FIXTURE") then
+        run_case("offline hit via hot cache", {
+            Candidate.new("苹果"),
+        }, { "苹果|  apple" })
 
-    run_case("vertical layout shows up to 5", {
-        Candidate.new("果实"),
-    }, { "果实|  apple / fruit" })
+        run_case("vertical layout shows up to 5", {
+            Candidate.new("果实"),
+        }, { "果实|  apple / fruit" })
 
-    run_case("vertical caps at configured max (6th word dropped)", {
-        Candidate.new("跑"),
-    }, { "跑|  run / operate / manage / race / walk" })
+        run_case("vertical caps at configured max (6th word dropped)", {
+            Candidate.new("跑"),
+        }, { "跑|  run / operate / manage / race / walk" })
+    end
 end
 
 run_case("non-CJK untouched", {
@@ -114,8 +116,26 @@ run_case("unknown word -> no comment, still yielded", {
     Candidate.new("未知词"),
 }, { "未知词|" })
 
--- shadow candidate replacement path
+-- shadow candidate replacement path (default fixtures only; home3 uses a
+-- custom comment_format, so the exact comment differs)
 ShadowCandidate = Candidate
-run_case("shadow candidate gets replaced with comment", {
-    Candidate.new("苹果", "", "simplified"),
-}, { "苹果|  apple" })
+if not os.getenv("FIXTURE") then
+    run_case("shadow candidate gets replaced with comment", {
+        Candidate.new("苹果", "", "simplified"),
+    }, { "苹果|  apple" })
+end
+
+-- comment display overrides (tests/fixtures/home3)
+if os.getenv("FIXTURE") == "home3" then
+    -- comment_format wraps; max_comment_chars caps bytes but never splits
+    -- a UTF-8 char ("〔apple / fruit〕" is 25 bytes; cap 10 -> "〔apple /")
+    run_case("comment_format + max_comment_chars", {
+        Candidate.new("果实"),
+    }, { "果实|  〔apple /" })
+
+    -- "〔apple〕" is 11 bytes; cap 10 backs off to the valid boundary "〔apple"
+    run_case("annotate_first_only + boundary-safe truncation", {
+        Candidate.new("苹果"),
+        Candidate.new("跑"),
+    }, { "苹果|  〔apple", "跑|" })
+end
