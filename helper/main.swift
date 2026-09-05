@@ -249,6 +249,104 @@ func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
 }
 
 // MARK: - Hot cache export
+//
+// The lua filter reloads its cache whenever the data changes. Rewriting the
+// full multi-MB TSV on every learned word forces the filter into a full
+// re-read on the typing path, so updates follow a base+delta protocol:
+//   rime_translate_cache.tsv      base snapshot, "#rev=<n>" header
+//   rime_translate_cache.delta    append-only entries added since the base
+//   rime_translate_cache.meta     "base=<rev> delta_off=<bytes> rev=<rev>"
+// The filter re-reads the base only when meta's base rev changes; otherwise
+// it merges the few new delta bytes. Legacy filters that only watch the
+// TSV's #rev header keep working unchanged.
+
+let hotBaseURL = rimeDir().appendingPathComponent("rime_translate_cache.tsv")
+let hotDeltaURL = rimeDir().appendingPathComponent("rime_translate_cache.delta")
+let hotMetaURL = rimeDir().appendingPathComponent("rime_translate_cache.meta")
+
+// only touched on exportQueue
+var hotBaseRev = 0
+var hotDeltaOff: UInt64 = 0
+var hotDeltaLines = 0
+
+func atomicWrite(_ text: String, to url: URL) {
+    let tmp = url.appendingPathExtension("tmp")
+    if (try? text.write(to: tmp, atomically: true, encoding: .utf8)) != nil {
+        _ = try? FileManager.default.replaceItemAt(url, withItemAt: tmp)
+    }
+}
+
+func writeHotMeta(rev: Int) {
+    atomicWrite("base=\(hotBaseRev) delta_off=\(hotDeltaOff) rev=\(rev)\n", to: hotMetaURL)
+}
+
+func hotTsvEntry(_ zh: String, _ en: String) -> String? {
+    guard !zh.contains("\t"), !en.contains("\t"),
+          !en.contains("\n"), !en.contains("\r"),
+          zh.utf8.count <= 48 else { return nil }
+    return "\(zh)\t\(truncated(en))"
+}
+
+func exportHotCache(_ dict: Dict) {
+    let dir = rimeDir()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+    let rev = Int(Date().timeIntervalSince1970 * 1000)
+    var lines: [String] = ["#rev=\(rev)"]
+    let cached = dict.allCached()
+    for p in dict.topPhrases(hotCacheTopN * 3) {
+        guard isCommonCJK(p.zh), let e = hotTsvEntry(p.zh, p.en) else { continue }
+        lines.append(e)
+        if lines.count >= hotCacheTopN + cached.count { break }
+    }
+    // ai results LAST: the filter's loader overwrites duplicates as it reads,
+    // so curated/learned translations win over raw dictionary noise
+    for p in cached {
+        if let e = hotTsvEntry(p.zh, p.en) { lines.append(e) }
+    }
+    let tmp = hotBaseURL.appendingPathExtension("tmp")
+    if (try? lines.joined(separator: "\n").appendLine().write(to: tmp, atomically: true, encoding: .utf8)) != nil {
+        _ = try? FileManager.default.replaceItemAt(hotBaseURL, withItemAt: tmp)
+    }
+    atomicWrite("", to: hotDeltaURL)
+    hotBaseRev = rev
+    hotDeltaOff = 0
+    hotDeltaLines = 0
+    writeHotMeta(rev: rev)
+}
+
+/// Incremental update: append new entries to the delta file, then publish
+/// the new offset via meta. The filter sees meta change and merges exactly
+/// those bytes -- no full re-read. The delta write completes before the
+/// meta write, so a filter that observes meta.off can always read the data.
+/// Once the delta has grown past 2000 lines the base is rebuilt so a fresh
+/// session never has to replay an ever-growing delta.
+func appendHotDelta(_ dict: Dict, _ entries: [(zh: String, en: String)]) {
+    let rev = Int(Date().timeIntervalSince1970 * 1000)
+    var chunk = ""
+    for p in entries {
+        if let e = hotTsvEntry(p.zh, p.en) { chunk += e + "\n" }
+    }
+    guard !chunk.isEmpty else { return }
+    if !FileManager.default.fileExists(atPath: hotDeltaURL.path) {
+        atomicWrite("", to: hotDeltaURL)
+    }
+    guard let fh = try? FileHandle(forWritingTo: hotDeltaURL) else { return }
+    defer { try? fh.close() }
+    let data = Data(chunk.utf8)
+    _ = try? fh.seekToEnd()
+    try? fh.write(contentsOf: data)
+    hotDeltaOff += UInt64(data.count)
+    writeHotMeta(rev: rev)
+    hotDeltaLines += chunk.filter { $0 == "\n" }.count
+    if hotDeltaLines > 2000 {
+        exportHotCache(dict)
+    }
+}
+
+// MARK: - async request pipeline
+
+// MARK: - Hot cache helpers
 
 func isCommonCJK(_ s: String) -> Bool {
     // restrict hot-cache entries to the URO basic block so rare
@@ -262,31 +360,8 @@ func truncated(_ en: String) -> String {
     return parts.joined(separator: "|")
 }
 
-func exportHotCache(_ dict: Dict) {
-    let dir = rimeDir()
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    let tmp = dir.appendingPathComponent(".rime_translate_cache.tsv.tmp")
-    let dst = dir.appendingPathComponent("rime_translate_cache.tsv")
-
-    var lines: [String] = []
-    lines.append("#rev=\(Int(Date().timeIntervalSince1970 * 1000))")
-    let cached = dict.allCached()
-    for p in dict.topPhrases(hotCacheTopN * 3) {
-        guard !p.zh.contains("\t"), !p.en.contains("\t"), !p.en.contains("\n"),
-              p.zh.utf8.count <= 48, isCommonCJK(p.zh) else { continue }
-        lines.append("\(p.zh)\t\(truncated(p.en))")
-        if lines.count >= hotCacheTopN + cached.count { break }
-    }
-    // ai results LAST: the filter's loader overwrites duplicates as it reads,
-    // so curated/learned translations win over raw dictionary noise
-    for p in cached where !p.zh.contains("\t") && !p.en.contains("\t")
-                       && !p.en.contains("\n") && !p.en.contains("\r") {
-        lines.append("\(p.zh)\t\(truncated(p.en))")
-    }
-    let payload = lines.joined(separator: "\n") + "\n"
-    if (try? payload.write(to: tmp, atomically: true, encoding: .utf8)) != nil {
-        _ = try? FileManager.default.replaceItemAt(dst, withItemAt: tmp)
-    }
+extension String {
+    func appendLine() -> String { self + "\n" }
 }
 
 // MARK: - async request pipeline
@@ -307,51 +382,57 @@ func doExportHotCache(_ dict: Dict) {
     exportQueue.sync { exportHotCache(dict) }
 }
 
-func drainOnce(_ dict: Dict) async -> Bool {
+func doAppendHotDelta(_ dict: Dict, _ entries: [(zh: String, en: String)]) {
+    exportQueue.sync { appendHotDelta(dict, entries) }
+}
+
+/// Returns the entries learned/found during this drain so the caller can
+/// push them into the hot cache incrementally.
+func drainOnce(_ dict: Dict) async -> [(zh: String, en: String)] {
     // Consume the request file by byte offset and NEVER truncate it:
     // lua appends with plain open("a") while we read, so the old
     // atomic-replace-to-empty used to silently drop every append that
     // landed on the old inode between our read and the swap.
     guard let fh = try? FileHandle(forReadingFrom: requestsURL) else {
         requestsOffset = 0
-        return false
+        return []
     }
     defer { try? fh.close() }
     let size = ((try? FileManager.default.attributesOfItem(atPath: requestsURL.path))?[.size] as? UInt64) ?? 0
-    if size <= requestsOffset { return false }
+    if size <= requestsOffset { return [] }
     try? fh.seek(toOffset: requestsOffset)
     let chunk = fh.readDataToEndOfFile()
     // only consume up to the last complete line; a torn tail line
     // (lua mid-append) stays pending for the next pass
-    guard !chunk.isEmpty, let lastNL = chunk.lastIndex(of: UInt8(ascii: "\n")) else { return false }
+    guard !chunk.isEmpty, let lastNL = chunk.lastIndex(of: UInt8(ascii: "\n")) else { return [] }
     let complete = chunk[chunk.startIndex...lastNL]
     requestsOffset += UInt64(complete.count)
     let raw = String(decoding: complete, as: UTF8.self)
 
-    var added = false
+    var learned: [(zh: String, en: String)] = []
     for word in raw.split(separator: "\n") {
         let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
         if attempted.contains(zh) { continue }
 
-        var added_word = false
+        var entry: (zh: String, en: String)? = nil
         if let en = dict.lookupDict(zh) {
             // dict hit outside the top-30k hot cache: pin it into
             // ai_cache so it lands in the exported hot cache too
             dict.insertCache(zh, en)
-            added_word = true
-        } else if dict.lookupCache(zh) != nil {
-            added_word = true
+            entry = (zh, en)
+        } else if let en = dict.lookupCache(zh) {
+            entry = (zh, en)
         } else if let cfg = dict.aiConfig {
             attempted.insert(zh)
             // fully async: no semaphore, never blocks the caller
             if let en = await translateWithAI(zh, cfg: cfg) {
                 dict.insertCache(zh, en)
-                added_word = true
+                entry = (zh, en)
                 NSLog("ai: %@ -> %@", zh, en)
             }
         }
-        if added_word { added = true }
+        if let e = entry { learned.append(e) }
     }
     // the file only ever grows; roll it over once it passes 4 MB (checked
     // right after a full drain, so our offset covers everything). Appends
@@ -362,16 +443,22 @@ func drainOnce(_ dict: Dict) async -> Bool {
         try? FileManager.default.moveItem(at: requestsURL, to: requestsOldURL)
         requestsOffset = 0
     }
-    return added
+    return learned
 }
 
 func drainLoop(_ dict: Dict) -> Task<Void, Never> {
     return Task.detached(priority: .utility) {
         while !Task.isCancelled {
-            if await drainOnce(dict) {
-                doExportHotCache(dict)
+            let learned = await drainOnce(dict)
+            if learned.isEmpty {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                continue
             }
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            // small batches: append to the delta file so the filter merges
+            // just those bytes instead of re-reading the whole base; the
+            // exporter itself rolls over to a full rebuild periodically
+            doAppendHotDelta(dict, learned)
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 }
@@ -390,7 +477,7 @@ func jsonResponse(_ conn: NWConnection, code: Int, body: String) {
     })
 }
 
-func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, hotDirty: HotDirty, conn: NWConnection) {
+func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, conn: NWConnection) {
     guard let req = String(data: data, encoding: .utf8),
           let firstLine = req.split(separator: "\r\n", maxSplits: 1).first else {
         return jsonResponse(conn, code: 400, body: "{}")
@@ -425,7 +512,7 @@ func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, hotDirty: H
             return jsonResponse(conn, code: 200,
                 body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\(escapeJSON(en))\",\"source\":\"dict\"}")
         }
-        maybeTranslate(q, dict: dict, pending: pending, hotDirty: hotDirty)
+        maybeTranslate(q, dict: dict, pending: pending)
         return jsonResponse(conn, code: 200,
             body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\",\"source\":\"pending\"}")
 
@@ -464,25 +551,15 @@ final class NegativeCache {
     }
 }
 
-final class HotDirty {
-    private let lock = NSLock()
-    private var dirty = false
-    func mark() {
-        lock.lock(); dirty = true; lock.unlock()
-    }
-    func take() -> Bool {
-        lock.lock(); let d = dirty; dirty = false; lock.unlock()
-        return d
-    }
-}
-
-func maybeTranslate(_ q: String, dict: Dict, pending: NegativeCache, hotDirty: HotDirty) {
+func maybeTranslate(_ q: String, dict: Dict, pending: NegativeCache) {
     guard let cfg = dict.aiConfig, !pending.contains(q) else { return }
     pending.mark(q)
     Task.detached(priority: .utility) {
-        guard let en = await translateWithAI(q, cfg: cfg) else { return }
-        dict.insertCache(q, en)
-        hotDirty.mark()
+        if let en = await translateWithAI(q, cfg: cfg) {
+            dict.insertCache(q, en)
+            // HTTP path is debug-only; delta-append keeps it consistent
+            doAppendHotDelta(dict, [(q, en)])
+        }
     }
 }
 
@@ -520,7 +597,6 @@ if dict.topPhrases(1).isEmpty {
 }
 
 let pending = NegativeCache()
-let hotDirty = HotDirty()
 
 // start serving BEFORE the heavy initial export so restarts are instant
 let params = NWParameters.tcp
@@ -530,7 +606,7 @@ listener.newConnectionHandler = { (conn: NWConnection) in
     conn.start(queue: .global(qos: .userInitiated))
     conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, error in
         if let data = data, error == nil {
-            handleRequest(data, dict: dict, pending: pending, hotDirty: hotDirty, conn: conn)
+            handleRequest(data, dict: dict, pending: pending, conn: conn)
         } else {
             conn.cancel()
         }
@@ -548,16 +624,12 @@ listener.stateUpdateHandler = { (state: NWListener.State) in
 }
 listener.start(queue: .main)
 
-// background startup work: initial export + request drain loop
+// background startup: initial base export, THEN the drain loop -- delta
+// appends must never run before a base snapshot exists
 Task.detached(priority: .utility) {
     doExportHotCache(dict)
+    _ = drainLoop(dict)
 }
-_ = drainLoop(dict)
-
-let flushTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-flushTimer.schedule(deadline: .now() + 5, repeating: 5)
-flushTimer.setEventHandler { if hotDirty.take() { doExportHotCache(dict) } }
-flushTimer.resume()
 
 let configFD = open(configPath, O_EVTONLY)
 if configFD >= 0 {
