@@ -250,15 +250,16 @@ func exportHotCache(_ dict: Dict) {
 
     var lines: [String] = []
     lines.append("#rev=\(Int(Date().timeIntervalSince1970 * 1000))")
+    let cached = dict.allCached()
     for p in dict.topPhrases(hotCacheTopN * 3) {
         guard !p.zh.contains("\t"), !p.en.contains("\t"),
               p.zh.utf8.count <= 48, isCommonCJK(p.zh) else { continue }
         lines.append("\(p.zh)\t\(truncated(p.en))")
-        if lines.count >= hotCacheTopN + dict.allCached().count { break }
+        if lines.count >= hotCacheTopN + cached.count { break }
     }
     // ai results LAST: the filter's loader overwrites duplicates as it reads,
     // so curated/learned translations win over raw dictionary noise
-    for p in dict.allCached() where !p.zh.contains("\t") && !p.en.contains("\t") {
+    for p in cached where !p.zh.contains("\t") && !p.en.contains("\t") {
         lines.append("\(p.zh)\t\(truncated(p.en))")
     }
     let payload = lines.joined(separator: "\n") + "\n"
