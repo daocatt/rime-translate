@@ -151,6 +151,9 @@ python3 scripts/enrich_ai.py --db ~/Library/Application\ Support/rime-translate/
 ```
 
 结果写入 db 的 `ai_cache` 表并自动进入热缓存，**优先于原始词典显示**。
+注意免费额度按模型计价：`m2m100-1.2b` 约 0.3 neurons/次（每天可跑 3 万+），
+`llama-3.3-70b` 约 11 neurons/次（每天约 900 个词）——脚本会按所配模型自动
+限制当日调用量。
 
 ---
 
@@ -163,6 +166,9 @@ patch:
   translate/max_entries_horizontal: 2   # 横排最多几个英文词
   translate/max_entries_vertical: 5     # 竖排最多几个
   translate/separator: " / "
+  translate/comment_format: "%s"        # printf 风格包装，如 "〔%s〕"
+  translate/max_comment_chars: 0        # 注释字节上限，超出截断（0=不限）
+  translate/annotate_first_only: false  # 只注释第一个候选
   translate/orientation_override: auto  # auto | horizontal | vertical
   translate/helper_port: 61899
   translate/max_candidate_len: 12       # 超长候选不翻译
@@ -174,17 +180,23 @@ patch:
 ## 工作原理
 
 ```
-┌─ Squirrel ─────────────────────────────────┐
-│ lua filter: 内存缓存 → 热缓存(3万高频词)    │  ← 打字路径, 微秒级
-│             未命中词追加一行到请求文件       │  ← 文件写入, 无阻塞
-└─────────────────────────────────────────────┘
-        │ 版本号变化时重载热缓存(读一行)
-┌─ rime-translate-helper (常驻) ─────────────┐
-│  每秒消化请求文件:                          │
-│   SQLite 离线库 → Cloudflare Workers AI    │  ← 异步, 永不阻塞打字
-│  结果写入 ai_cache → 刷新热缓存(#rev+1)    │
-└─────────────────────────────────────────────┘
+┌─ Squirrel ─────────────────────────────────────┐
+│ lua filter: 内存缓存 → 热缓存(3万高频词)        │  ← 打字路径, 微秒级
+│             未命中词追加一行到请求文件           │  ← 文件写入, 无阻塞
+└─────────────────────────────────────────────────┘
+        │ .meta 未变 → 只合并热缓存的增量字节
+┌─ rime-translate-helper (常驻) ──────────────────┐
+│  消化请求文件(按偏移读, 不截断):                 │
+│   SQLite 离线库 → Cloudflare Workers AI(并发)   │  ← 异步, 永不阻塞打字
+│  结果追加到 .delta 增量文件 + .meta 记录偏移     │
+│  增量超 2000 行后重建全量 base                   │
+└─────────────────────────────────────────────────┘
 ```
+
+热缓存采用 **base + delta** 协议：helper 维护全量 `rime_translate_cache.tsv`
+（base）加一个只追加的 `.delta` 文件；lua 侧每次部署/未命中时只读一行
+`.meta` 判断版本，版本没变就只合并 `.delta` 里新增的几行，而不是重读
+几 MB 的 base——这是打字路径上最大的延迟来源，现已消除。
 
 ## 排障
 
@@ -193,7 +205,7 @@ patch:
 | 候选没注释 | `curl http://127.0.0.1:61899/health` 应返回 ok；确认已重新部署 |
 | helper 未运行 | `launchctl kickstart -k gui/$(id -u)/com.rimetranslate.helper` |
 | 冷门词第一次没翻译 | 正常——停 1~2 秒再打就有了（异步回填） |
-| 想看 filter 内部行为 | `tail -f /tmp/rime_translate_debug.log`（自动限 512KB） |
+| 想看 filter 内部行为 | 设置环境变量 `RIME_TRANSLATE_DEBUG=1` 后重新部署，再 `tail -f /tmp/rime_translate_debug.log`（默认关闭、自动限 512KB） |
 | AI 报错 | 检查 `/tmp/rime-translate-helper.log`；确认 Token 有 Workers AI 权限 |
 
 ## 卸载
@@ -223,9 +235,10 @@ lipo -create /tmp/h1 /tmp/h2 -output dist/rime-translate-helper
 # 本机安装（开发者版）
 zsh scripts/install.sh
 
-# 单元测试
+# 单元测试（3 套 fixture：默认竖排 / 横排 / 注释格式化配置）
 HOME=$PWD/tests/fixtures/home lua tests/test_filter.lua
 HOME=$PWD/tests/fixtures/home2 EXPECT_LAYOUT=horizontal lua tests/test_filter.lua
+HOME=$PWD/tests/fixtures/home3 FIXTURE=home3 lua tests/test_filter.lua
 
 # 发布 Release（gh cli 已登录）
 zsh scripts/release.sh
