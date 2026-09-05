@@ -375,7 +375,19 @@ extension String {
 let requestsURL = rimeDir().appendingPathComponent("rime_translate_requests.txt")
 let requestsOldURL = rimeDir().appendingPathComponent("rime_translate_requests.txt.old")
 var requestsOffset: UInt64 = 0
-var attempted = Set<String>()
+// zh -> retry-eligible time. Failures (network blips, CF limits) get a
+// 10-minute backoff instead of being blacklisted forever.
+var attempted: [String: Date] = [:]
+
+/// One AI translate attempt: on success pin it into ai_cache and log.
+/// Split out so drainOnce can run several of these concurrently.
+func translateAttempt(_ zh: String, dict: Dict) async -> (String, String?) {
+    guard let cfg = dict.aiConfig else { return (zh, nil) }
+    guard let en = await translateWithAI(zh, cfg: cfg) else { return (zh, nil) }
+    dict.insertCache(zh, en)
+    NSLog("ai: %@ -> %@", zh, en)
+    return (zh, en)
+}
 let exportQueue = DispatchQueue(label: "rime-translate.export")
 
 func doExportHotCache(_ dict: Dict) {
@@ -410,29 +422,46 @@ func drainOnce(_ dict: Dict) async -> [(zh: String, en: String)] {
     let raw = String(decoding: complete, as: UTF8.self)
 
     var learned: [(zh: String, en: String)] = []
+    var aiWords: [String] = []
     for word in raw.split(separator: "\n") {
         let zh = String(word).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !zh.isEmpty, zh.utf8.count <= 120 else { continue }
-        if attempted.contains(zh) { continue }
+        if let expiry = attempted[zh], expiry > Date() { continue }
 
-        var entry: (zh: String, en: String)? = nil
         if let en = dict.lookupDict(zh) {
             // dict hit outside the top-30k hot cache: pin it into
             // ai_cache so it lands in the exported hot cache too
             dict.insertCache(zh, en)
-            entry = (zh, en)
+            learned.append((zh, en))
         } else if let en = dict.lookupCache(zh) {
-            entry = (zh, en)
-        } else if let cfg = dict.aiConfig {
-            attempted.insert(zh)
-            // fully async: no semaphore, never blocks the caller
-            if let en = await translateWithAI(zh, cfg: cfg) {
-                dict.insertCache(zh, en)
-                entry = (zh, en)
-                NSLog("ai: %@ -> %@", zh, en)
+            learned.append((zh, en))
+        } else if dict.aiConfig != nil {
+            aiWords.append(zh)
+        }
+    }
+    // AI misses translate concurrently (bounded) -- a batch of cold words
+    // finishes in the time of the slowest call instead of the sum
+    if !aiWords.isEmpty {
+        let maxConcurrent = 3
+        var idx = 0
+        await withTaskGroup(of: (String, String?).self) { group in
+            for _ in 0..<min(maxConcurrent, aiWords.count) {
+                let zh = aiWords[idx]; idx += 1
+                group.addTask { await translateAttempt(zh, dict: dict) }
+            }
+            for await (zh, en) in group {
+                if let en = en {
+                    learned.append((zh, en))
+                } else {
+                    // retry eligible in 10 minutes (network blips, CF limits)
+                    attempted[zh] = Date().addingTimeInterval(600)
+                }
+                if idx < aiWords.count {
+                    let next = aiWords[idx]; idx += 1
+                    group.addTask { await translateAttempt(next, dict: dict) }
+                }
             }
         }
-        if let e = entry { learned.append(e) }
     }
     // the file only ever grows; roll it over once it passes 4 MB (checked
     // right after a full drain, so our offset covers everything). Appends
