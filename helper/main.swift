@@ -660,15 +660,50 @@ Task.detached(priority: .utility) {
     _ = drainLoop(dict)
 }
 
-let configFD = open(configPath, O_EVTONLY)
-if configFD >= 0 {
-    let configWatch = DispatchSource.makeFileSystemObjectSource(
-        fileDescriptor: configFD,
-        eventMask: [.write, .delete],
-        queue: .global(qos: .utility))
-    configWatch.setEventHandler { dict.reloadConfig(configURL) }
-    configWatch.resume()
+// Watches config.json by fd. Editors/scripts usually save via tmp+rename,
+// which swaps the inode -- after a .delete/.rename event the old fd would
+// go deaf forever, so re-open and re-arm on the new file. AIConfig.load
+// reads by path, so the reload at delete time already picks up new content.
+final class ConfigWatcher {
+    private let url: URL
+    private let onReload: () -> Void
+    private var fd: Int32 = -1
+    private var source: DispatchSourceFileSystemObject?
+
+    init(url: URL, onReload: @escaping () -> Void) {
+        self.url = url
+        self.onReload = onReload
+        arm()
+    }
+
+    private func arm() {
+        if source != nil { source?.cancel(); source = nil }
+        if fd >= 0 { close(fd); fd = -1 }
+        fd = open(url.path, O_EVTONLY)
+        guard fd >= 0 else {
+            // missing right now (mid atomic-replace): retry shortly
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.arm()
+            }
+            return
+        }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename],
+            queue: .global(qos: .utility))
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.onReload()
+            if src.data.contains(.delete) || src.data.contains(.rename) {
+                self.arm()
+            }
+        }
+        src.resume()
+        source = src
+    }
 }
+
+let configWatcher = ConfigWatcher(url: configURL) { dict.reloadConfig(configURL) }
 
 signal(SIGINT) { _ in exit(0) }
 signal(SIGTERM) { _ in exit(0) }
