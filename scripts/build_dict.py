@@ -332,6 +332,9 @@ def main():
         ) WITHOUT ROWID;
         CREATE INDEX idx_zh_en_score ON zh_en(score DESC);
         CREATE INDEX idx_zh_en_freq ON zh_en(zh_freq DESC);
+        -- exact cover for the helper's topPhrases() ORDER BY; without it the
+        -- hot-cache export temp-B-tree sorts all 2.7M rows
+        CREATE INDEX idx_zh_en_freq_score ON zh_en(zh_freq DESC, score DESC);
         CREATE TABLE ai_cache (
             zh TEXT PRIMARY KEY,
             en TEXT NOT NULL,

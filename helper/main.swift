@@ -85,6 +85,10 @@ final class Dict {
                     zh TEXT PRIMARY KEY, en TEXT NOT NULL, created_at INTEGER NOT NULL
                 );
                 """, nil, nil, nil)
+            // covers topPhrases' ORDER BY exactly; without it SQLite temp-
+            // B-tree sorts 2.7M rows on every hot-cache export (minutes on
+            // first run of a freshly built db). IF NOT EXISTS upgrades old dbs.
+            sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_zh_en_freq_score ON zh_en(zh_freq DESC, score DESC);", nil, nil, nil)
             var d: OpaquePointer?
             sqlite3_prepare_v2(db, "SELECT en FROM zh_en WHERE zh = ?1", -1, &d, nil)
             stmtDict = d
@@ -653,12 +657,14 @@ listener.stateUpdateHandler = { (state: NWListener.State) in
 }
 listener.start(queue: .main)
 
-// background startup: initial base export, THEN the drain loop -- delta
-// appends must never run before a base snapshot exists
+// background startup: drain loop starts immediately -- the initial base
+// export runs concurrently (it can take a while on a cold 2.7M-row db) and
+// must never delay AI translation. doAppendHotDelta/doExportHotCache are
+// serialized on exportQueue, so there's no interleaving hazard.
 Task.detached(priority: .utility) {
     doExportHotCache(dict)
-    _ = drainLoop(dict)
 }
+_ = drainLoop(dict)
 
 // Watches config.json by fd. Editors/scripts usually save via tmp+rename,
 // which swaps the inode -- after a .delete/.rename event the old fd would
