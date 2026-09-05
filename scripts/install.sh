@@ -52,6 +52,6 @@ cat <<'EOF'
     3. optional AI fallback: create
        "~/Library/Application Support/rime-translate/config.json":
          {"account_id":"<CF_ACCOUNT_ID>","api_token":"<CF_API_TOKEN>",
-          "model":"@cf/meta/m2m100-1.2B"}
+          "model":"@cf/meta/m2m100-1.2b"}
     4. redeploy Squirrel
 EOF

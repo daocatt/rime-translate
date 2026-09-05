@@ -85,7 +85,7 @@ PATCH
 
 可选开启 AI 兜底（离线词典未命中的词走 Cloudflare 翻译）：
   创建 "$APP_DIR/config.json":
-    {"account_id":"<CF账号ID>","api_token":"<API Token>","model":"@cf/meta/m2m100-1.2B"}
+    {"account_id":"<CF账号ID>","api_token":"<API Token>","model":"@cf/meta/m2m100-1.2b"}
   然后执行: launchctl kickstart -k gui/\$(id -u)/com.rimetranslate.helper
 ==================================================================
 EOF
