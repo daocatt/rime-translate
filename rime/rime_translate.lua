@@ -101,15 +101,16 @@ local function detect_orientation()
         "/Library/Input Methods/Squirrel.app/Contents/SharedSupport/squirrel.yaml",
     }
     -- modern themes: candidate_list_layout (linear=horizontal, stacked=vertical)
+    -- (no $ anchor: these keys sit mid-file, before other lines)
     for _, p in ipairs(files) do
-        local v = scan_yaml_value(p, "candidate_list_layout:%s*(%a+)%s*$")
+        local v = scan_yaml_value(p, "candidate_list_layout:%s*(%a+)")
         if v == "linear" then return "horizontal" end
         if v == "stacked" then return "vertical" end
-        v = scan_yaml_value(p, "text_orientation:%s*(%a+)%s*$")
+        v = scan_yaml_value(p, "text_orientation:%s*(%a+)")
         if v == "horizontal" then return "horizontal" end
         if v == "vertical" then return "vertical" end
-        -- legacy key
-        v = scan_yaml_value(p, "^%s*horizontal:%s*(%a+)%s*$")
+        -- legacy key: `horizontal: true` or `style/horizontal: true`
+        v = scan_yaml_value(p, "horizontal:%s*(%a+)")
         if v == "true" then return "horizontal" end
         if v == "false" then return "vertical" end
     end
