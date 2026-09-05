@@ -1,5 +1,7 @@
 .DS_Store
-dist/*.db
+# build artifacts (db, WAL sidecars, helper binary, copied lua)
+dist/*
+!dist/.gitkeep
 *.o
 nohup.out
 config.json
