@@ -36,18 +36,25 @@ local DEFAULTS = {
     max_candidate_len = 12,
 }
 
--- debug tracing to /tmp/rime_translate_debug.log (set env
--- RIME_TRANSLATE_DEBUG=0 in launchd/plist to disable; on by default)
+-- debug tracing to /tmp/rime_translate_debug.log, OFF by default.
+-- enable per session with the environment variable RIME_TRANSLATE_DEBUG=1
+-- (e.g. via launchd plist env or `open`), then tail the file.
 local dbg = nil
+local dbg_buf = {}
 local function trace(fmt, ...)
     if not dbg then return end
     local ok, msg = pcall(string.format, fmt, ...)
     if not ok then msg = "?" end
-    pcall(dbg.write, dbg, os.date("%H:%M:%S ") .. msg .. "\n")
-    pcall(dbg.flush, dbg)
+    -- buffer writes; flush in batches to keep the typing path syscall-free
+    dbg_buf[#dbg_buf + 1] = os.date("%H:%M:%S ") .. msg .. "\n"
+    if #dbg_buf >= 32 then
+        pcall(dbg.write, dbg, table.concat(dbg_buf))
+        dbg_buf = {}
+    end
 end
 
 local function open_debug()
+    if os.getenv("RIME_TRANSLATE_DEBUG") ~= "1" then return end
     -- keep the debug log bounded (512 KB): start fresh when oversized
     local path = "/tmp/rime_translate_debug.log"
     local f = io.open(path, "a")
@@ -270,7 +277,13 @@ function M.init(env)
     if not ok then trace("init ERROR: %s", tostring(err)) end
 end
 
-function M.fini(env) end
+function M.fini(env)
+    if dbg then
+        pcall(dbg.write, dbg, table.concat(dbg_buf))
+        pcall(dbg.close, dbg)
+        dbg = nil
+    end
+end
 
 function M.func(input, env)
     for cand in input:iter() do
