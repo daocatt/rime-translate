@@ -1,0 +1,4 @@
+patch:
+  translate/comment_format: "〔%s〕"
+  translate/max_comment_chars: 10
+  translate/annotate_first_only: true

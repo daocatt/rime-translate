@@ -15,9 +15,12 @@
 -- Configuration (~/Library/Rime/rime_translate.custom.yaml):
 --
 --   patch:
---     translate/max_entries_horizontal: 2   # horizontal layout: show N words
+--   translate/max_entries_horizontal: 2   # horizontal layout: show N words
 --     translate/max_entries_vertical: 5     # vertical layout: show M words
 --     translate/separator: " / "
+--     translate/comment_format: "%s"        # printf-style, e.g. "〔%s〕"
+--     translate/max_comment_chars: 0        # truncate comment to N chars (0=off)
+--     translate/annotate_first_only: false  # annotate only the first candidate
 --     translate/orientation_override: auto  # auto | horizontal | vertical
 --     translate/helper_port: 61899
 --     translate/max_candidate_len: 12       # skip longer phrases
@@ -34,6 +37,9 @@ local DEFAULTS = {
     orientation = "auto",
     helper_port = 61899,
     max_candidate_len = 12,
+    comment_format = "%s",          -- rendered text, printf-style
+    max_comment_chars = 0,          -- 0 = no truncation
+    annotate_first_only = false,    -- annotate only the first candidate
 }
 
 -- debug tracing to /tmp/rime_translate_debug.log, OFF by default.
@@ -140,6 +146,11 @@ local function load_config(env)
         cfg.max_candidate_len = num("translate/max_candidate_len", cfg.max_candidate_len)
         local sep = content:match('translate/separator:%s*[\'"]([^\'"]*)[\'"]')
         if sep then cfg.separator = sep end
+        local fmt = content:match('translate/comment_format:%s*[\'"]([^\'"]*)[\'"]')
+        if fmt then cfg.comment_format = fmt end
+        cfg.max_comment_chars = num("translate/max_comment_chars", cfg.max_comment_chars)
+        local first_only = content:match("translate/annotate_first_only:%s*(%a+)")
+        if first_only == "true" then cfg.annotate_first_only = true end
         local ori = content:match("translate/orientation_override:%s*(%a+)")
         if ori then cfg.orientation = ori end
     end
@@ -258,7 +269,8 @@ local function is_cjk(text)
     return true
 end
 
--- pick first N english words out of "w1|w2|w3|..." joined by separator
+-- pick first N english words out of "w1|w2|w3|..." joined by separator,
+-- then apply comment_format and max_comment_chars
 local function render(en)
     if not en or en == "" then return nil end
     local limit = (cfg.layout == "horizontal") and cfg.max_entries_horizontal
@@ -271,7 +283,18 @@ local function render(en)
         parts[#parts + 1] = w:match("^%s*(.-)%s*$")  -- trim
     end
     if count == 0 then return nil end
-    return table.concat(parts, cfg.separator)
+    local text = cfg.comment_format == "%s" and table.concat(parts, cfg.separator)
+        or string.format(cfg.comment_format, table.concat(parts, cfg.separator))
+    if cfg.max_comment_chars > 0 and #text > cfg.max_comment_chars then
+        -- byte cap, but never split a UTF-8 char: back off until the byte
+        -- after the cut starts a new character
+        local cut = cfg.max_comment_chars
+        while cut > 0 and math.floor(text:byte(cut + 1) / 64) == 2 do
+            cut = cut - 1
+        end
+        if cut > 0 then text = text:sub(1, cut) else text = "" end
+    end
+    return text
 end
 
 local function lookup(zh)
@@ -320,13 +343,18 @@ function M.fini(env)
 end
 
 function M.func(input, env)
+    -- annotate_first_only: annotate at most the first translatable candidate
+    -- in this composition (per-keystroke, so it tracks the highlighted word)
+    local first_done = false
     for cand in input:iter() do
         local handled = false
-        if cfg.enabled and is_cjk(cand.text) and cand.type ~= "raw" then
+        if cfg.enabled and is_cjk(cand.text) and cand.type ~= "raw"
+            and not (cfg.annotate_first_only and first_done) then
             local ok, en = pcall(lookup, cand.text)
             if ok and en then
                 local rendered = render(en)
                 if rendered then
+                    first_done = true
                     -- shadow candidates created by the simplifier do not
                     -- render comments assigned afterwards; replace them
                     -- with an equivalent plain candidate instead

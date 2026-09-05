@@ -8,6 +8,12 @@ patch:
   # 竖向候选时最多显示几个英文词
   translate/max_entries_vertical: 5
   translate/separator: " / "
+  # 注释格式（printf 风格，%s 为英文释义），如 "〔%s〕" 或 "(%s)"
+  # translate/comment_format: "%s"
+  # 注释最大字节数，超出截断（0 = 不限制；不会截断半个汉字/字符）
+  # translate/max_comment_chars: 0
+  # 只注释第一个候选（其余候选保持干净）
+  # translate/annotate_first_only: false
   # 横竖排检测：auto=读 Squirrel 设置；也可强制 horizontal / vertical
   translate/orientation_override: auto
   # helper 监听端口（与 LaunchAgent 保持一致）
