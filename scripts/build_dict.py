@@ -300,15 +300,16 @@ def main():
                     counts = phrase_seen.setdefault(v, {})
                     cnt = counts.get(wl, 0)
                     if cnt == 0:
+                        # counts is a pure mention counter (multi-sense
+                        # evidence); heap membership is one-way: an evicted
+                        # word never re-enters, and eviction must not rewind
+                        # the mention history of words still in the heap
                         if k > 0:
                             entry = (weighted, word)
                             if len(h) < k:
                                 heapq.heappush(h, entry)
                             elif weighted > h[0][0]:
-                                old = heapq.heapreplace(h, entry)
-                                ol = old[1].lower()
-                                if counts.get(ol):
-                                    counts[ol] -= 1
+                                heapq.heapreplace(h, entry)
                         else:
                             h.append((weighted, word))
                     counts[wl] = cnt + 1
