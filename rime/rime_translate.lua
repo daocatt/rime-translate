@@ -72,9 +72,9 @@ end
 
 local M = {}
 
+local HOME = os.getenv("HOME") or ""
 local cfg = {}
 local mem_cache = {}      -- zh -> en string (pipe separated); false = pending
-local neg_cache = {}      -- kept for compatibility; unused since async mode
 local hot_cache = {}      -- _rev = version from helper
 local requested = {}      -- words already written to the request file
 
@@ -102,9 +102,8 @@ local function detect_orientation()
     if cfg.orientation == "horizontal" or cfg.orientation == "vertical" then
         return cfg.orientation
     end
-    local home = os.getenv("HOME") or ""
     local files = {
-        home .. "/Library/Rime/squirrel.custom.yaml",
+        HOME .. "/Library/Rime/squirrel.custom.yaml",
         "/Library/Input Methods/Squirrel.app/Contents/SharedSupport/squirrel.yaml",
     }
     -- modern themes: candidate_list_layout (linear=horizontal, stacked=vertical)
@@ -127,8 +126,7 @@ end
 local function load_config(env)
     for k, v in pairs(DEFAULTS) do cfg[k] = v end
     -- user overrides
-    local home = os.getenv("HOME") or ""
-    local content = read_file(home .. "/Library/Rime/rime_translate.custom.yaml")
+    local content = read_file(HOME .. "/Library/Rime/rime_translate.custom.yaml")
     if content then
         local function num(key, default)
             local n = tonumber(content:match(key .. ":%s*(-?[%d%.]+)"))
@@ -144,16 +142,13 @@ local function load_config(env)
         if sep then cfg.separator = sep end
         local ori = content:match("translate/orientation_override:%s*(%a+)")
         if ori then cfg.orientation = ori end
-        local maxlen = num("translate/max_candidate_len", cfg.max_candidate_len)
-        cfg.max_candidate_len = maxlen
     end
     cfg.layout = detect_orientation()
 end
 
 -- cheap freshness check: read only the "#rev=" header line (no subprocess)
 local function cache_rev()
-    local home = os.getenv("HOME") or ""
-    local f = io.open(home .. "/Library/Rime/rime_translate_cache.tsv", "rb")
+    local f = io.open(HOME .. "/Library/Rime/rime_translate_cache.tsv", "rb")
     if not f then return nil end
     local head = f:read(40) or ""
     f:close()
@@ -168,8 +163,7 @@ local function load_hot_cache()
     end
     if hot_cache._rev == rev then return false end
 
-    local home = os.getenv("HOME") or ""
-    local path = home .. "/Library/Rime/rime_translate_cache.tsv"
+    local path = HOME .. "/Library/Rime/rime_translate_cache.tsv"
     local new_cache = { _rev = rev }
     local count = 0
     local ok, err = pcall(function()
@@ -190,7 +184,6 @@ local function load_hot_cache()
     hot_cache = new_cache
     -- entries may have been filled: retry everything pending this session
     mem_cache = {}
-    neg_cache = {}
     requested = {}
     trace("hot cache loaded: %d entries (rev=%s)", count, tostring(rev))
     return true
@@ -201,8 +194,7 @@ end
 local function request_word(zh)
     if requested[zh] then return end
     requested[zh] = true
-    local home = os.getenv("HOME") or ""
-    local f = io.open(home .. "/Library/Rime/rime_translate_requests.txt", "a")
+    local f = io.open(HOME .. "/Library/Rime/rime_translate_requests.txt", "a")
     if not f then return end
     f:write(zh, "\n")
     f:close()
@@ -211,17 +203,15 @@ end
 
 local function is_cjk(text)
     if not text or text == "" then return false end
-    local n = 0
-    local ok = pcall(function()
-        for _, cp in utf8.codes(text) do
-            n = n + 1
-            if n > cfg.max_candidate_len then error("too_long") end
-            if not ((cp >= 0x3400 and cp <= 0x9FFF) or (cp >= 0xF900 and cp <= 0xFAFF)) then
-                error("not_cjk")
-            end
+    -- fast reject: wrong length or invalid utf8 (utf8.len fails on bad input)
+    local n = utf8.len(text)
+    if not n or n == 0 or n > cfg.max_candidate_len then return false end
+    for _, cp in utf8.codes(text) do
+        if not ((cp >= 0x3400 and cp <= 0x9FFF) or (cp >= 0xF900 and cp <= 0xFAFF)) then
+            return false
         end
-    end)
-    return ok and n > 0
+    end
+    return true
 end
 
 -- pick first N english words out of "w1|w2|w3|..." joined by separator
@@ -309,7 +299,14 @@ function M.func(input, env)
                             trace("replace FAILED (%s): %s", cand.text, tostring(err2))
                         end
                     else
-                        cand.comment = (cand.comment or "") .. "  " .. rendered
+                        -- some librime candidate types reject comment writes;
+                        -- never let annotation break the candidate stream
+                        local ok2, err2 = pcall(function()
+                            cand.comment = (cand.comment or "") .. "  " .. rendered
+                        end)
+                        if not ok2 then
+                            trace("comment FAILED (%s): %s", cand.text, tostring(err2))
+                        end
                         trace("annotated: %s [%s] type=%s", cand.text, rendered, cand.type)
                     end
                 end
