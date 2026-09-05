@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Batch-enrich the local dictionary with Cloudflare Workers AI translations.
 
-Uses the FREE neuron allowance of Workers AI (m2m100 costs ~0.28
-neurons/request; the free plan includes 10k neurons/day => roughly 30k+ 
-translations per day at zero cost).
+Uses the FREE neuron allowance of Workers AI. Cost per request depends
+on the model: m2m100 ~0.3 neurons (=> 30k+ free translations/day on the
+10k-neuron free plan); llama-3.3-70b ~11 neurons (=> ~900/day).
 
 Targets common Chinese words (high zh_freq) whose current English list is
 missing or looks low-quality, translates them with the configured model and
@@ -24,7 +24,21 @@ import time
 import urllib.request
 
 NEURON_FREE_PER_DAY = 10000
-NEURONS_PER_CALL = 0.3          # m2m100 approximation
+
+# approximate neurons per single-word request, matched by substring against
+# --model (Cloudflare's per-model pricing; LLMs cost ~30x more than m2m100)
+NEURON_COSTS = [
+    ("m2m100", 0.3),
+    ("llama-3.3-70b", 11.0),
+]
+DEFAULT_NEURON_COST = 11.0     # conservative for unknown chat models
+
+
+def neurons_per_call(model):
+    for needle, cost in NEURON_COSTS:
+        if needle in model:
+            return cost
+    return DEFAULT_NEURON_COST
 
 
 def looks_weak(en):
@@ -114,7 +128,10 @@ def main():
     print(f"candidates: {len(todo)} (scanned {len(rows)}, "
           f"already enriched {len(done)})", file=sys.stderr)
 
-    budget = NEURON_FREE_PER_DAY / NEURONS_PER_CALL
+    npc = neurons_per_call(args.model)
+    budget = int(NEURON_FREE_PER_DAY / npc)
+    print(f"model {args.model}: ~{npc} neurons/call -> free-tier budget "
+          f"~{budget} calls/day", file=sys.stderr)
     n = 0
     for zh in todo:
         if n >= args.limit or n >= budget:
