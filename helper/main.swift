@@ -132,10 +132,9 @@ final class Dict {
 
     func insertCache(_ zh: String, _ en: String) {
         queue.sync {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql = "INSERT OR REPLACE INTO ai_cache VALUES (?1, ?2, ?3)"
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            guard let stmt = stmtInsert else { return }
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
             sqlite3_bind_text(stmt, 1, zh, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 2, en, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(stmt, 3, Int64(Date().timeIntervalSince1970))
@@ -176,6 +175,26 @@ final class Dict {
 
 // MARK: - Cloudflare Workers AI
 
+/// Cleans AI/model output before it is stored or exported:
+/// the hot cache is a one-translation-per-line TSV, so any newline would
+/// corrupt the file for the lua reader; stray quotes/numbering from chat
+/// models ("1. apple") would render verbatim in candidates.
+func sanitizeAI(_ s: String) -> String {
+    var t = s
+    // strip common chat-model decorations: leading "1. "/"1. "/"- "
+    while let r = t.range(of: #"^\s*(?:[-•*]|\d+[.、)])\s*"#, options: .regularExpression) {
+        t.removeSubrange(r)
+    }
+    t = t.replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\t", with: " ")
+    // collapse runs of spaces left by the newline swap
+    while t.contains("  ") {
+        t = t.replacingOccurrences(of: "  ", with: " ")
+    }
+    return t.trimmingCharacters(in: .whitespaces)
+}
+
 func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
     let urlStr = "https://api.cloudflare.com/client/v4/accounts/\(cfg.accountID)/ai/run/\(cfg.model)"
     guard let url = URL(string: urlStr) else { return nil }
@@ -210,20 +229,21 @@ func translateWithAI(_ text: String, cfg: AIConfig) async -> String? {
               !t.isEmpty else { return nil }
         return t
     }
-    // translation models: result.translated_text (string or array)
-    if let dict = result as? [String: Any] {
-        if let one = pick(dict["translated_text"] as? String) { return one }
-        if let r = pick(dict["response"] as? String) { return r }
-    }
-    if let arr = result as? [[String: Any]] {
-        let parts = arr.compactMap { $0["translated_text"] as? String }
-        return pick(parts.joined(separator: " "))
-    }
     // chat models: result.choices[0].message.content
     if let dict = result as? [String: Any],
        let choices = dict["choices"] as? [[String: Any]],
-       let msg = choices.first?["message"] as? [String: Any] {
-        return pick(msg["content"] as? String)
+       let msg = choices.first?["message"] as? [String: Any],
+       let content = pick(msg["content"] as? String) {
+        return sanitizeAI(content)
+    }
+    // translation models: result.translated_text (string or array)
+    if let dict = result as? [String: Any] {
+        if let one = pick(dict["translated_text"] as? String) { return sanitizeAI(one) }
+        if let r = pick(dict["response"] as? String) { return sanitizeAI(r) }
+    }
+    if let arr = result as? [[String: Any]] {
+        let parts = arr.compactMap { $0["translated_text"] as? String }
+        if let joined = pick(parts.joined(separator: " ")) { return sanitizeAI(joined) }
     }
     return nil
 }
@@ -252,14 +272,15 @@ func exportHotCache(_ dict: Dict) {
     lines.append("#rev=\(Int(Date().timeIntervalSince1970 * 1000))")
     let cached = dict.allCached()
     for p in dict.topPhrases(hotCacheTopN * 3) {
-        guard !p.zh.contains("\t"), !p.en.contains("\t"),
+        guard !p.zh.contains("\t"), !p.en.contains("\t"), !p.en.contains("\n"),
               p.zh.utf8.count <= 48, isCommonCJK(p.zh) else { continue }
         lines.append("\(p.zh)\t\(truncated(p.en))")
         if lines.count >= hotCacheTopN + cached.count { break }
     }
     // ai results LAST: the filter's loader overwrites duplicates as it reads,
     // so curated/learned translations win over raw dictionary noise
-    for p in cached where !p.zh.contains("\t") && !p.en.contains("\t") {
+    for p in cached where !p.zh.contains("\t") && !p.en.contains("\t")
+                       && !p.en.contains("\n") && !p.en.contains("\r") {
         lines.append("\(p.zh)\t\(truncated(p.en))")
     }
     let payload = lines.joined(separator: "\n") + "\n"
