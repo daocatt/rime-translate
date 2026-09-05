@@ -298,6 +298,8 @@ func exportHotCache(_ dict: Dict) {
 // that the filter notices cheaply (reads one line) and reloads.
 
 let requestsURL = rimeDir().appendingPathComponent("rime_translate_requests.txt")
+let requestsOldURL = rimeDir().appendingPathComponent("rime_translate_requests.txt.old")
+var requestsOffset: UInt64 = 0
 var attempted = Set<String>()
 let exportQueue = DispatchQueue(label: "rime-translate.export")
 
@@ -306,9 +308,25 @@ func doExportHotCache(_ dict: Dict) {
 }
 
 func drainOnce(_ dict: Dict) async -> Bool {
-    guard let raw = try? String(contentsOf: requestsURL, encoding: .utf8),
-          !raw.isEmpty else { return false }
-    try? "".write(to: requestsURL, atomically: true, encoding: .utf8)
+    // Consume the request file by byte offset and NEVER truncate it:
+    // lua appends with plain open("a") while we read, so the old
+    // atomic-replace-to-empty used to silently drop every append that
+    // landed on the old inode between our read and the swap.
+    guard let fh = try? FileHandle(forReadingFrom: requestsURL) else {
+        requestsOffset = 0
+        return false
+    }
+    defer { try? fh.close() }
+    let size = ((try? FileManager.default.attributesOfItem(atPath: requestsURL.path))?[.size] as? UInt64) ?? 0
+    if size <= requestsOffset { return false }
+    try? fh.seek(toOffset: requestsOffset)
+    let chunk = fh.readDataToEndOfFile()
+    // only consume up to the last complete line; a torn tail line
+    // (lua mid-append) stays pending for the next pass
+    guard !chunk.isEmpty, let lastNL = chunk.lastIndex(of: UInt8(ascii: "\n")) else { return false }
+    let complete = chunk[chunk.startIndex...lastNL]
+    requestsOffset += UInt64(complete.count)
+    let raw = String(decoding: complete, as: UTF8.self)
 
     var added = false
     for word in raw.split(separator: "\n") {
@@ -334,6 +352,15 @@ func drainOnce(_ dict: Dict) async -> Bool {
             }
         }
         if added_word { added = true }
+    }
+    // the file only ever grows; roll it over once it passes 4 MB (checked
+    // right after a full drain, so our offset covers everything). Appends
+    // landing between the read and the rename would be stranded in the old
+    // inode -- a once-per-megabytes microsecond window we accept.
+    if requestsOffset > 4_000_000 {
+        try? FileManager.default.removeItem(at: requestsOldURL)
+        try? FileManager.default.moveItem(at: requestsURL, to: requestsOldURL)
+        requestsOffset = 0
     }
     return added
 }
