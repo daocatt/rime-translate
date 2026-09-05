@@ -146,25 +146,19 @@ local function load_config(env)
     cfg.layout = detect_orientation()
 end
 
--- cheap freshness check: read only the "#rev=" header line (no subprocess)
-local function cache_rev()
-    local f = io.open(HOME .. "/Library/Rime/rime_translate_cache.tsv", "rb")
-    if not f then return nil end
-    local head = f:read(40) or ""
-    f:close()
-    return tonumber(head:match("#rev=(%d+)"))
+-- cheap freshness check: read only the meta file (one short line).
+-- Format from the helper: "base=<rev> delta_off=<bytes> rev=<rev>"
+local function hot_meta()
+    local content = read_file(HOME .. "/Library/Rime/rime_translate_cache.meta")
+    if not content then return nil end
+    local base, off, rev = content:match("base=(%d+) delta_off=(%d+) rev=(%d+)")
+    if not rev then return nil end
+    return tonumber(base), tonumber(off), tonumber(rev)
 end
 
-local function load_hot_cache()
-    local rev = cache_rev()
-    if rev == nil then
-        trace("hot cache: unreadable or missing")
-        return false
-    end
-    if hot_cache._rev == rev then return false end
-
-    local path = HOME .. "/Library/Rime/rime_translate_cache.tsv"
-    local new_cache = { _rev = rev }
+-- full read of the base TSV -- only on init or when the helper rebuilt it
+local function load_base(path, rev)
+    local new_cache = {}
     local count = 0
     local ok, err = pcall(function()
         for line in io.lines(path) do
@@ -182,11 +176,61 @@ local function load_hot_cache()
         return false
     end
     hot_cache = new_cache
+    hot_cache._base = rev
     -- entries may have been filled: retry everything pending this session
     mem_cache = {}
     requested = {}
-    trace("hot cache loaded: %d entries (rev=%s)", count, tostring(rev))
+    trace("hot cache base loaded: %d entries (rev=%s)", count, tostring(rev))
     return true
+end
+
+local function load_hot_cache()
+    local base, off, rev = hot_meta()
+    if rev == nil then
+        -- legacy helper (no meta file): fall back to the TSV #rev header
+        local f = io.open(HOME .. "/Library/Rime/rime_translate_cache.tsv", "rb")
+        if not f then
+            trace("hot cache: unreadable or missing")
+            return false
+        end
+        local head = f:read(40) or ""
+        f:close()
+        rev = tonumber(head:match("#rev=(%d+)"))
+        if rev == nil then return false end
+        if hot_cache._base == rev then return false end
+        return load_base(HOME .. "/Library/Rime/rime_translate_cache.tsv", rev)
+    end
+
+    if hot_cache._base ~= base then
+        return load_base(HOME .. "/Library/Rime/rime_translate_cache.tsv", base)
+    end
+    -- base unchanged: merge only the new delta bytes (a few lines)
+    local delta_done = hot_cache._delta or 0
+    if off <= delta_done then return false end
+    local path = HOME .. "/Library/Rime/rime_translate_cache.delta"
+    local f = io.open(path, "rb")
+    if not f then return false end
+    f:seek("set", delta_done)
+    local chunk = f:read("*a")
+    f:close()
+    if not chunk or chunk == "" then return false end
+    -- only consume complete lines; the torn tail is picked up next time
+    local cut = chunk:match("()[^\n]*$")
+    local complete = chunk:sub(1, cut - 1)
+    if complete == "" then return false end
+    local added = 0
+    for line in complete:gmatch("[^\n]+") do
+        local zh, en = line:match("^(.-)\t(.+)$")
+        if zh and en and en ~= "" then
+            hot_cache[zh] = en
+            added = added + 1
+        end
+    end
+    -- publish even if parse failed: never re-read the same bytes forever
+    hot_cache._delta = off
+    if added > 0 then mem_cache = {} end
+    trace("hot cache delta: +%d (off=%d rev=%d)", added, off, rev)
+    return added > 0
 end
 
 -- fire-and-forget miss reporting: a plain file append, never blocks.
