@@ -152,6 +152,24 @@ if not os.getenv("FIXTURE") then
         Candidate.new("apple", "", "raw"),
     }, { "未知词|", "apple|" })
 
+    -- pure-Chinese schema: plain pinyin must not be treated as English
+    env.engine.context.input = "shi"
+    env.engine.context.get_preedit = function() return { text = "shi" } end
+    run_case("plain pinyin is not annotated with English IPA", {
+        Candidate.new("苹果"),
+    }, { "苹果|  apple" })
+    env.engine.context.input = nil
+    env.engine.context.get_preedit = nil
+
+    -- pure-Chinese schema: forced segmentation becomes English + IPA
+    env.engine.context.input = "apple"
+    env.engine.context.get_preedit = function() return { text = "a p p le" } end
+    run_case("forced pinyin segmentation is replaced with English + IPA", {
+        Candidate.new("阿婆了", "", "sentence"),
+    }, { "apple|  /ˈæpəl/" })
+    env.engine.context.input = nil
+    env.engine.context.get_preedit = nil
+
     -- simulate schema with `rime_translate` switch
     local switch_val = false
     local sw_env = {
@@ -192,8 +210,11 @@ if not os.getenv("FIXTURE") then
     env = sw_env
     run_case("runtime switch OFF disables translation (phonetic stays ON)", {
         Candidate.new("苹果"),
+    }, { "苹果|" })
+
+    run_case("runtime switch OFF keeps phonetic on 1st candidate", {
         Candidate.new("apple", "", "table"),
-    }, { "苹果|", "apple|  /ˈæpəl/" })
+    }, { "apple|  /ˈæpəl/" })
 
     switch_val = true
     run_case("runtime switch ON re-enables translation", {
@@ -203,5 +224,59 @@ if not os.getenv("FIXTURE") then
     run_case("runtime switch ON re-enables phonetic on 1st candidate", {
         Candidate.new("apple", "", "raw"),
     }, { "apple|  /ˈæpəl/" })
+
+    -- simulate schema with both switches
+    local ph_on = false
+    local ph_env = {
+        engine = {
+            schema = {
+                config = {
+                    get_list = function(_, k)
+                        if k ~= "switches" then return nil end
+                        return {
+                            size = 2,
+                            get_at = function(_, i)
+                                local name = (i == 0) and "rime_translate" or "rime_translate_phonetic"
+                                return {
+                                    get_map = function()
+                                        return {
+                                            get_value = function(_, fld)
+                                                if fld == "name" then
+                                                    return { get_string = function() return name end }
+                                                end
+                                            end
+                                        }
+                                    end
+                                }
+                            end
+                        }
+                    end
+                }
+            },
+            context = {
+                get_option = function(_, name)
+                    if name == "rime_translate" then return true end
+                    if name == "rime_translate_phonetic" then return ph_on end
+                    return false
+                end
+            }
+        }
+    }
+    M.init(ph_env)
+    env = ph_env
+    run_case("phonetic switch OFF disables IPA", {
+        Candidate.new("apple", "", "table"),
+    }, { "apple|" })
+    ph_on = true
+    run_case("phonetic switch ON enables IPA", {
+        Candidate.new("apple", "", "table"),
+    }, { "apple|  /ˈæpəl/" })
     env = saved_env
+end
+
+-- phonetic_format override (tests/fixtures/home4)
+if os.getenv("FIXTURE") == "home4" then
+    run_case("phonetic_format %s renders bare IPA", {
+        Candidate.new("apple", "", "table"),
+    }, { "apple|  ˈæpəl" })
 end

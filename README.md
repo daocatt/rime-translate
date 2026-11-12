@@ -258,10 +258,11 @@ lipo -create /tmp/h1 /tmp/h2 -output dist/rime-translate-helper
 # 本机安装（开发者版）
 zsh scripts/install.sh
 
-# 单元测试（3 套 fixture：默认竖排 / 横排 / 注释格式化配置）
+# 单元测试（4 套 fixture：默认竖排 / 横排 / 注释格式化 / 音标格式）
 HOME=$PWD/tests/fixtures/home lua tests/test_filter.lua
 HOME=$PWD/tests/fixtures/home2 EXPECT_LAYOUT=horizontal lua tests/test_filter.lua
 HOME=$PWD/tests/fixtures/home3 FIXTURE=home3 lua tests/test_filter.lua
+HOME=$PWD/tests/fixtures/home4 FIXTURE=home4 lua tests/test_filter.lua
 
 # 发布 Release（gh cli 已登录）
 zsh scripts/release.sh
