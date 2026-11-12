@@ -242,6 +242,27 @@ final class Dict {
         }
         return out
     }
+
+    /// Keep the learned phonetic cache bounded. Only words outside the
+    /// top-N hot cache need to be pinned here, so a large table is pure
+    /// growth; drop the oldest rows once it exceeds `keep`.
+    func prunePhoneticCache(keep: Int) {
+        queue.sync {
+            var count = 0
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM en_phonetic_cache", -1, &stmt, nil) == SQLITE_OK,
+               sqlite3_step(stmt) == SQLITE_ROW {
+                count = Int(sqlite3_column_int64(stmt, 0))
+            }
+            sqlite3_finalize(stmt)
+            guard count > keep else { return }
+            sqlite3_exec(db, """
+                DELETE FROM en_phonetic_cache WHERE word NOT IN (
+                    SELECT word FROM en_phonetic_cache ORDER BY created_at DESC LIMIT \(keep)
+                );
+                """, nil, nil, nil)
+        }
+    }
 }
 
 // MARK: - Cloudflare Workers AI
@@ -439,6 +460,7 @@ func exportPhoneticHotCache(_ dict: Dict) {
     let dir = rimeDir()
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
+    dict.prunePhoneticCache(keep: 50000)
     let rev = Int(Date().timeIntervalSince1970 * 1000)
     var lines: [String] = ["#rev=\(rev)"]
     for p in dict.topPhonetics(hotCacheTopN) {

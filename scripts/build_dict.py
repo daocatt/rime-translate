@@ -289,7 +289,10 @@ def main():
         if not word or not word.isascii() or "_" in word:
             continue
         wl = word.lower()
-        frq_val = int(row.get("frq") or 0)
+        try:
+            frq_val = int(row.get("frq") or 0)
+        except (ValueError, TypeError):
+            frq_val = 0
         if " " not in wl:
             ipa = us_ipa_map.get(wl)
             if not ipa and args.fallback_ecdict_phonetic:
@@ -312,7 +315,7 @@ def main():
             try:
                 oxford = str(row.get("oxford") or "0").strip() == "1"
                 collins = int(row.get("collins") or 0)
-                has_frq = int(row.get("frq") or 0) > 0
+                has_frq = frq_val > 0
             except (ValueError, TypeError):
                 oxford, collins, has_frq = False, 0, False
             # drop 1-3 letter tokens with no curation or web frequency
