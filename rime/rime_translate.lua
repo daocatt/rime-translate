@@ -460,15 +460,27 @@ function M.func(input, env)
     for cand in input:iter() do
         cand_idx = cand_idx + 1
         local handled = false
-        if cand_idx == 1 and phonetic_on and is_english_word(cand.text) then
-            local ok, ipa = pcall(lookup_store, en_store, cand.text:lower())
-            if ok and ipa then
-                local rendered = render_phonetic(ipa)
-                if rendered then
-                    handled = annotate_candidate(cand, rendered)
+        if cand_idx == 1 and phonetic_on then
+            local word, prefix = nil, ""
+            if is_english_word(cand.text) then
+                word = cand.text:lower()
+            elseif ctx and ctx.input and #ctx.input >= 3 and is_english_word(ctx.input) then
+                -- Fallback for pure-Chinese schemas (e.g. luna_pinyin_simp) without an English translator:
+                -- preedit input is an English word even though candidate #1 is Chinese.
+                word = ctx.input:lower()
+                prefix = ctx.input .. " "
+            end
+            if word then
+                local ok, ipa = pcall(lookup_store, en_store, word)
+                if ok and ipa then
+                    local rendered = render_phonetic(ipa)
+                    if rendered then
+                        handled = annotate_candidate(cand, prefix .. rendered)
+                    end
                 end
             end
-        elseif translate_on and is_cjk(cand.text) and cand.type ~= "raw"
+        end
+        if not handled and translate_on and is_cjk(cand.text) and cand.type ~= "raw"
             and not (cfg.annotate_first_only and first_done) then
             local ok, en = pcall(lookup_store, zh_store, cand.text)
             if ok and en then
