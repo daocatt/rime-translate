@@ -192,6 +192,28 @@ def word_score(row, word):
     return score
 
 
+def parse_us_ipa(path):
+    """Parse US IPA dictionary (e.g. open-dict-data/ipa-dict en_US.txt:
+    'word\\t/ipa1/, /ipa2/'). Returns {lowercase_word: ipa}."""
+    ipa_map = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith(";;;"):
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            w = parts[0].strip().lower()
+            if not w or not w.isascii():
+                continue
+            # take primary pronunciation, strip surrounding slashes
+            first = parts[1].split(",")[0].strip().strip("/")
+            if first and w not in ipa_map:
+                ipa_map[w] = first
+    return ipa_map
+
+
 def iter_rows(path):
     """Yield dict rows from either an ECDICT csv file or the official
     ecdict-sqlite release (stardict.db)."""
@@ -201,7 +223,7 @@ def iter_rows(path):
         conn.row_factory = sqlite3.Row
         try:
             for row in conn.execute(
-                    "SELECT word, translation, collins, oxford, bnc, frq, exchange FROM stardict"):
+                    "SELECT word, phonetic, translation, collins, oxford, bnc, frq, exchange FROM stardict"):
                 yield {k: row[k] for k in row.keys()}
         finally:
             conn.close()
@@ -227,6 +249,10 @@ def main():
                     help="CC-CEDICT file merged as a high-priority source")
     ap.add_argument("--zh-freq",
                     help="jieba-style word frequency list; ranks the hot cache")
+    ap.add_argument("--us-ipa",
+                    help="US IPA dictionary TSV (e.g. ipa-dict en_US.txt)")
+    ap.add_argument("--fallback-ecdict-phonetic", action="store_true",
+                    help="fall back to ECDICT phonetic column when missing from --us-ipa")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -248,6 +274,10 @@ def main():
     print(f"cc-cedict: {len(cedict_map)} entries", file=sys.stderr) if cedict_map else None
     zh_freq = load_zh_freq(args.zh_freq) if args.zh_freq else {}
     print(f"zh-freq: {len(zh_freq)} words", file=sys.stderr) if zh_freq else None
+    us_ipa_map = parse_us_ipa(args.us_ipa) if args.us_ipa else {}
+    print(f"us-ipa: {len(us_ipa_map)} words", file=sys.stderr) if us_ipa_map else None
+
+    phonetic_rows = {}  # lowercase word -> (us_ipa, frq)
 
     t0 = time.time()
     n_words = 0
@@ -258,6 +288,16 @@ def main():
         word = (row.get("word") or "").strip()
         if not word or not word.isascii() or "_" in word:
             continue
+        wl = word.lower()
+        frq_val = int(row.get("frq") or 0)
+        if " " not in wl:
+            ipa = us_ipa_map.get(wl)
+            if not ipa and args.fallback_ecdict_phonetic:
+                ipa = (row.get("phonetic") or "").strip().strip("/")
+            if ipa:
+                prev = phonetic_rows.get(wl)
+                if not prev or frq_val > prev[1]:
+                    phonetic_rows[wl] = (ipa, frq_val)
         exchange = row.get("exchange") or ""
         for m in EXCHANGE_LEMMA.finditer(exchange):
             lemma = m.group(1).strip().lower()
@@ -340,6 +380,17 @@ def main():
             en TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE en_phonetic (
+            word TEXT PRIMARY KEY,
+            us_ipa TEXT NOT NULL,
+            frq INTEGER NOT NULL DEFAULT 0
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_en_phonetic_frq ON en_phonetic(frq DESC);
+        CREATE TABLE en_phonetic_cache (
+            word TEXT PRIMARY KEY,
+            us_ipa TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
     """)
     batch = []
@@ -387,12 +438,27 @@ def main():
                 batch = []
     if batch:
         db.executemany("INSERT OR REPLACE INTO zh_en VALUES (?,?,?,?)", batch)
+
+    # include any US IPA entries not matched in ECDICT
+    for w, ipa in us_ipa_map.items():
+        if w not in phonetic_rows and " " not in w:
+            phonetic_rows[w] = (ipa, 0)
+    p_batch = []
+    for w, (ipa, frq_val) in phonetic_rows.items():
+        p_batch.append((w, ipa, frq_val))
+        if len(p_batch) >= 10000:
+            db.executemany("INSERT OR REPLACE INTO en_phonetic VALUES (?,?,?)", p_batch)
+            p_batch = []
+    if p_batch:
+        db.executemany("INSERT OR REPLACE INTO en_phonetic VALUES (?,?,?)", p_batch)
+
     db.executemany("INSERT INTO meta VALUES (?,?)", [
         ("source", "skywind3000/ECDICT + CC-CEDICT (MDBG)"),
         ("license", "ECDICT: MIT; CC-CEDICT: CC-BY-SA 4.0 (data package)"),
         ("built_at", str(int(time.time()))),
         ("words_scanned", str(n_words)),
         ("phrases", str(len(index))),
+        ("phonetics", str(len(phonetic_rows))),
     ])
     db.commit()
     size_mb = os.path.getsize(args.output) / 1048576

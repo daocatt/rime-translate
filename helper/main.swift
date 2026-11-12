@@ -64,6 +64,9 @@ final class Dict {
     private var stmtDict: OpaquePointer?
     private var stmtCache: OpaquePointer?
     private var stmtInsert: OpaquePointer?
+    private var stmtPhonetic: OpaquePointer?
+    private var stmtPhoneticCache: OpaquePointer?
+    private var stmtPhoneticInsert: OpaquePointer?
 
     init(path: String, configURL: URL) throws {
         if sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) != SQLITE_OK {
@@ -84,11 +87,18 @@ final class Dict {
                 CREATE TABLE IF NOT EXISTS ai_cache (
                     zh TEXT PRIMARY KEY, en TEXT NOT NULL, created_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS en_phonetic (
+                    word TEXT PRIMARY KEY, us_ipa TEXT NOT NULL, frq INTEGER NOT NULL DEFAULT 0
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS en_phonetic_cache (
+                    word TEXT PRIMARY KEY, us_ipa TEXT NOT NULL, created_at INTEGER NOT NULL
+                );
                 """, nil, nil, nil)
             // covers topPhrases' ORDER BY exactly; without it SQLite temp-
             // B-tree sorts 2.7M rows on every hot-cache export (minutes on
             // first run of a freshly built db). IF NOT EXISTS upgrades old dbs.
             sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_zh_en_freq_score ON zh_en(zh_freq DESC, score DESC);", nil, nil, nil)
+            sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_en_phonetic_frq ON en_phonetic(frq DESC);", nil, nil, nil)
             var d: OpaquePointer?
             sqlite3_prepare_v2(db, "SELECT en FROM zh_en WHERE zh = ?1", -1, &d, nil)
             stmtDict = d
@@ -98,6 +108,15 @@ final class Dict {
             var i: OpaquePointer?
             sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO ai_cache VALUES (?1, ?2, ?3)", -1, &i, nil)
             stmtInsert = i
+            var p: OpaquePointer?
+            sqlite3_prepare_v2(db, "SELECT us_ipa FROM en_phonetic WHERE word = ?1", -1, &p, nil)
+            stmtPhonetic = p
+            var pc: OpaquePointer?
+            sqlite3_prepare_v2(db, "SELECT us_ipa FROM en_phonetic_cache WHERE word = ?1", -1, &pc, nil)
+            stmtPhoneticCache = pc
+            var pi: OpaquePointer?
+            sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO en_phonetic_cache VALUES (?1, ?2, ?3)", -1, &pi, nil)
+            stmtPhoneticInsert = pi
         }
         sqlite3_exec(db, "PRAGMA busy_timeout=3000;", nil, nil, nil)
         if dbRO != nil {
@@ -146,6 +165,26 @@ final class Dict {
         }
     }
 
+    func lookupPhonetic(_ word: String) -> String? {
+        query(stmtPhonetic, bind: word.lowercased())
+    }
+
+    func lookupPhoneticCache(_ word: String) -> String? {
+        query(stmtPhoneticCache, bind: word.lowercased())
+    }
+
+    func insertPhoneticCache(_ word: String, _ ipa: String) {
+        queue.sync {
+            guard let stmt = stmtPhoneticInsert else { return }
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            sqlite3_bind_text(stmt, 1, word.lowercased(), -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, ipa, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(stmt, 3, Int64(Date().timeIntervalSince1970))
+            _ = sqlite3_step(stmt)
+        }
+    }
+
     /// Top phrases for the hot cache file. Uses the read-only connection so
     /// a long scan never blocks candidate lookups.
     func topPhrases(_ n: Int) -> [(zh: String, en: String)] {
@@ -169,6 +208,34 @@ final class Dict {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, "SELECT zh, en FROM ai_cache", -1, &stmt, nil) == SQLITE_OK else { return [] }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                        String(cString: sqlite3_column_text(stmt, 1))))
+        }
+        return out
+    }
+
+    func topPhonetics(_ n: Int) -> [(word: String, ipa: String)] {
+        guard let db = dbRO else { return [] }
+        var out: [(String, String)] = []
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = "SELECT word, us_ipa FROM en_phonetic ORDER BY frq DESC LIMIT ?1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int(stmt, 1, Int32(n))
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                        String(cString: sqlite3_column_text(stmt, 1))))
+        }
+        return out
+    }
+
+    func allPhoneticCached() -> [(word: String, ipa: String)] {
+        guard let db = dbRO else { return [] }
+        var out: [(String, String)] = []
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT word, us_ipa FROM en_phonetic_cache", -1, &stmt, nil) == SQLITE_OK else { return [] }
         while sqlite3_step(stmt) == SQLITE_ROW {
             out.append((String(cString: sqlite3_column_text(stmt, 0)),
                         String(cString: sqlite3_column_text(stmt, 1))))
@@ -268,10 +335,18 @@ let hotBaseURL = rimeDir().appendingPathComponent("rime_translate_cache.tsv")
 let hotDeltaURL = rimeDir().appendingPathComponent("rime_translate_cache.delta")
 let hotMetaURL = rimeDir().appendingPathComponent("rime_translate_cache.meta")
 
+let phoneticHotBaseURL = rimeDir().appendingPathComponent("rime_translate_phonetic.tsv")
+let phoneticHotDeltaURL = rimeDir().appendingPathComponent("rime_translate_phonetic.delta")
+let phoneticHotMetaURL = rimeDir().appendingPathComponent("rime_translate_phonetic.meta")
+
 // only touched on exportQueue
 var hotBaseRev = 0
 var hotDeltaOff: UInt64 = 0
 var hotDeltaLines = 0
+
+var phoneticBaseRev = 0
+var phoneticDeltaOff: UInt64 = 0
+var phoneticDeltaLines = 0
 
 func atomicWrite(_ text: String, to url: URL) {
     let tmp = url.appendingPathExtension("tmp")
@@ -348,6 +423,64 @@ func appendHotDelta(_ dict: Dict, _ entries: [(zh: String, en: String)]) {
     }
 }
 
+func writePhoneticMeta(rev: Int) {
+    atomicWrite("base=\(phoneticBaseRev) delta_off=\(phoneticDeltaOff) rev=\(rev)\n", to: phoneticHotMetaURL)
+}
+
+func phoneticTsvEntry(_ word: String, _ ipa: String) -> String? {
+    let w = word.lowercased()
+    guard !w.contains("\t"), !ipa.contains("\t"),
+          !ipa.contains("\n"), !ipa.contains("\r"),
+          !w.isEmpty, !ipa.isEmpty else { return nil }
+    return "\(w)\t\(ipa)"
+}
+
+func exportPhoneticHotCache(_ dict: Dict) {
+    let dir = rimeDir()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+    let rev = Int(Date().timeIntervalSince1970 * 1000)
+    var lines: [String] = ["#rev=\(rev)"]
+    for p in dict.topPhonetics(hotCacheTopN) {
+        if let e = phoneticTsvEntry(p.word, p.ipa) { lines.append(e) }
+    }
+    for p in dict.allPhoneticCached() {
+        if let e = phoneticTsvEntry(p.word, p.ipa) { lines.append(e) }
+    }
+    let tmp = phoneticHotBaseURL.appendingPathExtension("tmp")
+    if (try? lines.joined(separator: "\n").appendLine().write(to: tmp, atomically: true, encoding: .utf8)) != nil {
+        _ = try? FileManager.default.replaceItemAt(phoneticHotBaseURL, withItemAt: tmp)
+    }
+    atomicWrite("", to: phoneticHotDeltaURL)
+    phoneticBaseRev = rev
+    phoneticDeltaOff = 0
+    phoneticDeltaLines = 0
+    writePhoneticMeta(rev: rev)
+}
+
+func appendPhoneticDelta(_ dict: Dict, _ entries: [(word: String, ipa: String)]) {
+    let rev = Int(Date().timeIntervalSince1970 * 1000)
+    var chunk = ""
+    for p in entries {
+        if let e = phoneticTsvEntry(p.word, p.ipa) { chunk += e + "\n" }
+    }
+    guard !chunk.isEmpty else { return }
+    if !FileManager.default.fileExists(atPath: phoneticHotDeltaURL.path) {
+        atomicWrite("", to: phoneticHotDeltaURL)
+    }
+    guard let fh = try? FileHandle(forWritingTo: phoneticHotDeltaURL) else { return }
+    defer { try? fh.close() }
+    let data = Data(chunk.utf8)
+    _ = try? fh.seekToEnd()
+    try? fh.write(contentsOf: data)
+    phoneticDeltaOff += UInt64(data.count)
+    writePhoneticMeta(rev: rev)
+    phoneticDeltaLines += chunk.filter { $0 == "\n" }.count
+    if phoneticDeltaLines > 2000 {
+        exportPhoneticHotCache(dict)
+    }
+}
+
 // MARK: - async request pipeline
 
 // MARK: - Hot cache helpers
@@ -379,6 +512,10 @@ extension String {
 let requestsURL = rimeDir().appendingPathComponent("rime_translate_requests.txt")
 let requestsOldURL = rimeDir().appendingPathComponent("rime_translate_requests.txt.old")
 var requestsOffset: UInt64 = 0
+
+let phoneticRequestsURL = rimeDir().appendingPathComponent("rime_translate_phonetic_requests.txt")
+let phoneticRequestsOldURL = rimeDir().appendingPathComponent("rime_translate_phonetic_requests.txt.old")
+var phoneticRequestsOffset: UInt64 = 0
 // zh -> retry-eligible time. Failures (network blips, CF limits) get a
 // 10-minute backoff instead of being blacklisted forever.
 var attempted: [String: Date] = [:]
@@ -400,6 +537,14 @@ func doExportHotCache(_ dict: Dict) {
 
 func doAppendHotDelta(_ dict: Dict, _ entries: [(zh: String, en: String)]) {
     exportQueue.sync { appendHotDelta(dict, entries) }
+}
+
+func doExportPhoneticHotCache(_ dict: Dict) {
+    exportQueue.sync { exportPhoneticHotCache(dict) }
+}
+
+func doAppendPhoneticDelta(_ dict: Dict, _ entries: [(word: String, ipa: String)]) {
+    exportQueue.sync { appendPhoneticDelta(dict, entries) }
 }
 
 /// Returns the entries learned/found during this drain so the caller can
@@ -479,19 +624,59 @@ func drainOnce(_ dict: Dict) async -> [(zh: String, en: String)] {
     return learned
 }
 
+func drainPhoneticOnce(_ dict: Dict) -> [(word: String, ipa: String)] {
+    guard let fh = try? FileHandle(forReadingFrom: phoneticRequestsURL) else {
+        phoneticRequestsOffset = 0
+        return []
+    }
+    defer { try? fh.close() }
+    let size = ((try? FileManager.default.attributesOfItem(atPath: phoneticRequestsURL.path))?[.size] as? UInt64) ?? 0
+    if size <= phoneticRequestsOffset { return [] }
+    try? fh.seek(toOffset: phoneticRequestsOffset)
+    let chunk = fh.readDataToEndOfFile()
+    guard !chunk.isEmpty, let lastNL = chunk.lastIndex(of: UInt8(ascii: "\n")) else { return [] }
+    let complete = chunk[chunk.startIndex...lastNL]
+    phoneticRequestsOffset += UInt64(complete.count)
+    let raw = String(decoding: complete, as: UTF8.self)
+
+    var learned: [(word: String, ipa: String)] = []
+    for line in raw.split(separator: "\n") {
+        let w = String(line).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !w.isEmpty, w.utf8.count <= 64 else { continue }
+        if let ipa = dict.lookupPhonetic(w) {
+            dict.insertPhoneticCache(w, ipa)
+            learned.append((w, ipa))
+        } else if let ipa = dict.lookupPhoneticCache(w) {
+            learned.append((w, ipa))
+        }
+    }
+    if phoneticRequestsOffset > 4_000_000 {
+        try? FileManager.default.removeItem(at: phoneticRequestsOldURL)
+        try? FileManager.default.moveItem(at: phoneticRequestsURL, to: phoneticRequestsOldURL)
+        phoneticRequestsOffset = 0
+    }
+    return learned
+}
+
 func drainLoop(_ dict: Dict) -> Task<Void, Never> {
     return Task.detached(priority: .utility) {
         while !Task.isCancelled {
             let learned = await drainOnce(dict)
-            if learned.isEmpty {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                continue
+            let learnedPhonetic = drainPhoneticOnce(dict)
+            if !learned.isEmpty {
+                // small batches: append to the delta file so the filter merges
+                // just those bytes instead of re-reading the whole base; the
+                // exporter itself rolls over to a full rebuild periodically
+                doAppendHotDelta(dict, learned)
             }
-            // small batches: append to the delta file so the filter merges
-            // just those bytes instead of re-reading the whole base; the
-            // exporter itself rolls over to a full rebuild periodically
-            doAppendHotDelta(dict, learned)
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            if !learnedPhonetic.isEmpty {
+                doAppendPhoneticDelta(dict, learnedPhonetic)
+            }
+            if learned.isEmpty && learnedPhonetic.isEmpty {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            } else {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
         }
     }
 }
@@ -548,6 +733,26 @@ func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, conn: NWCon
         maybeTranslate(q, dict: dict, pending: pending)
         return jsonResponse(conn, code: 200,
             body: "{\"q\":\"\(escapeJSON(q))\",\"en\":\"\",\"source\":\"pending\"}")
+
+    case "/phonetic":
+        guard let qStart = target.range(of: "?q=") else {
+            return jsonResponse(conn, code: 400, body: "{\"error\":\"missing q\"}")
+        }
+        let raw = String(target[qStart.upperBound...])
+        let q = percentDecode(raw.split(separator: "&").map(String.init)[0]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty, q.utf8.count <= 64 else {
+            return jsonResponse(conn, code: 200, body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\",\"source\":\"none\"}")
+        }
+        if let ipa = dict.lookupPhoneticCache(q) {
+            return jsonResponse(conn, code: 200,
+                body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\(escapeJSON(ipa))\",\"source\":\"cache\"}")
+        }
+        if let ipa = dict.lookupPhonetic(q) {
+            return jsonResponse(conn, code: 200,
+                body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\(escapeJSON(ipa))\",\"source\":\"dict\"}")
+        }
+        return jsonResponse(conn, code: 200,
+            body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\",\"source\":\"none\"}")
 
     default:
         return jsonResponse(conn, code: 404, body: "{\"error\":\"not found\"}")
@@ -663,6 +868,7 @@ listener.start(queue: .main)
 // serialized on exportQueue, so there's no interleaving hazard.
 Task.detached(priority: .utility) {
     doExportHotCache(dict)
+    doExportPhoneticHotCache(dict)
 }
 _ = drainLoop(dict)
 

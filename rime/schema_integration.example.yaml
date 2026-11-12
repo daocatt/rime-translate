@@ -3,5 +3,17 @@
 # patch:
 #   engine/filters/+:
 #     - lua_filter@*rime_translate
+#   # 可选：在方案菜单（Ctrl+` / F4）中添加实时开关
+#   switches/+:
+#     - name: rime_translate
+#       reset: 1                 # 1=默认开启, 0=默认关闭
+#       states: [ 译关, 译开 ]
+#     # 可选：单独控制英文单词美音音标开关（不加则跟随 rime_translate）
+#     # - name: rime_translate_phonetic
+#     #   reset: 1
+#     #   states: [ 音关, 音开 ]
+#   # 可选：绑定快捷键实时切换翻译开关
+#   # key_binder/bindings/+:
+#   #   - { when: always, accept: "Control+Shift+T", toggle: rime_translate }
 #
 # 并把 rime_translate.lua 放到 ~/Library/Rime/lua/ 目录。

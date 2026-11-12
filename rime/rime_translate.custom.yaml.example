@@ -3,6 +3,12 @@
 
 patch:
   translate/enabled: true
+  # 方案 switches 中的开关名称（未配置 switches 时默认开启）
+  # translate/switch_name: "rime_translate"
+  # 输入英文单词时，第一个候选显示美音音标
+  # translate/phonetic_enabled: true
+  # translate/phonetic_switch_name: "rime_translate_phonetic"
+  # translate/phonetic_format: "美 /%s/"
   # 横向候选（style/horizontal: true）时最多显示几个英文词
   translate/max_entries_horizontal: 2
   # 竖向候选时最多显示几个英文词

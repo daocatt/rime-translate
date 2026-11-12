@@ -15,7 +15,12 @@
 -- Configuration (~/Library/Rime/rime_translate.custom.yaml):
 --
 --   patch:
---   translate/max_entries_horizontal: 2   # horizontal layout: show N words
+--     translate/enabled: true
+--     translate/switch_name: "rime_translate"
+--     translate/phonetic_enabled: true
+--     translate/phonetic_switch_name: "rime_translate_phonetic"
+--     translate/phonetic_format: "美 /%s/"
+--     translate/max_entries_horizontal: 2   # horizontal layout: show N words
 --     translate/max_entries_vertical: 5     # vertical layout: show M words
 --     translate/separator: " / "
 --     translate/comment_format: "%s"        # printf-style, e.g. "〔%s〕"
@@ -28,9 +33,17 @@
 -- Schema wiring:
 --   engine/filters/+:
 --     - lua_filter@*rime_translate
+--   switches/+:
+--     - name: rime_translate
+--       reset: 1
+--       states: [ 译关, 译开 ]
 
 local DEFAULTS = {
     enabled = true,
+    switch_name = "rime_translate",
+    phonetic_enabled = true,
+    phonetic_switch_name = "rime_translate_phonetic",
+    phonetic_format = "美 /%s/",
     max_entries_horizontal = 2,
     max_entries_vertical = 5,
     separator = " / ",
@@ -80,9 +93,23 @@ local M = {}
 
 local HOME = os.getenv("HOME") or ""
 local cfg = {}
-local mem_cache = {}      -- zh -> en string (pipe separated); false = pending
-local hot_cache = {}      -- _rev = version from helper
-local requested = {}      -- words already written to the request file
+local has_translate_switch = false
+local has_phonetic_switch = false
+
+local function make_cache_store(prefix, req_name)
+    return {
+        base_path = HOME .. "/Library/Rime/" .. prefix .. ".tsv",
+        delta_path = HOME .. "/Library/Rime/" .. prefix .. ".delta",
+        meta_path = HOME .. "/Library/Rime/" .. prefix .. ".meta",
+        req_path = HOME .. "/Library/Rime/" .. req_name,
+        mem = {},       -- key -> value; false = pending
+        hot = {},       -- _base, _delta
+        requested = {},
+    }
+end
+
+local zh_store = make_cache_store("rime_translate_cache", "rime_translate_requests.txt")
+local en_store = make_cache_store("rime_translate_phonetic", "rime_translate_phonetic_requests.txt")
 
 --------------------------------------------------------------------
 -- helpers
@@ -140,6 +167,14 @@ local function load_config(env)
         end
         local en = content:match("translate/enabled:%s*(%a+)")
         if en == "false" then cfg.enabled = false end
+        local sw = content:match('translate/switch_name:%s*[\'"]?([%w_%-]+)[\'"]?')
+        if sw and sw ~= "" then cfg.switch_name = sw end
+        local pe = content:match("translate/phonetic_enabled:%s*(%a+)")
+        if pe == "false" then cfg.phonetic_enabled = false end
+        local psw = content:match('translate/phonetic_switch_name:%s*[\'"]?([%w_%-]+)[\'"]?')
+        if psw and psw ~= "" then cfg.phonetic_switch_name = psw end
+        local pfmt = content:match('translate/phonetic_format:%s*[\'"]([^\'"]*)[\'"]')
+        if pfmt then cfg.phonetic_format = pfmt end
         cfg.max_entries_horizontal = num("translate/max_entries_horizontal", cfg.max_entries_horizontal)
         cfg.max_entries_vertical = num("translate/max_entries_vertical", cfg.max_entries_vertical)
         cfg.helper_port = num("translate/helper_port", cfg.helper_port)
@@ -159,8 +194,8 @@ end
 
 -- cheap freshness check: read only the meta file (one short line).
 -- Format from the helper: "base=<rev> delta_off=<bytes> rev=<rev>"
-local function hot_meta()
-    local content = read_file(HOME .. "/Library/Rime/rime_translate_cache.meta")
+local function hot_meta(store)
+    local content = read_file(store.meta_path)
     if not content then return nil end
     local base, off, rev = content:match("base=(%d+) delta_off=(%d+) rev=(%d+)")
     if not rev then return nil end
@@ -168,58 +203,57 @@ local function hot_meta()
 end
 
 -- full read of the base TSV -- only on init or when the helper rebuilt it
-local function load_base(path, rev)
+local function load_base(store, rev)
     local new_cache = {}
     local count = 0
     local ok, err = pcall(function()
-        for line in io.lines(path) do
+        for line in io.lines(store.base_path) do
             if not line:match("^#") then
-                local zh, en = line:match("^(.-)\t(.+)$")
-                if zh and en and en ~= "" then
-                    new_cache[zh] = en
+                local k, v = line:match("^(.-)\t(.+)$")
+                if k and v and v ~= "" then
+                    new_cache[k] = v
                     count = count + 1
                 end
             end
         end
     end)
     if not ok then
-        trace("hot cache load ERROR: %s", tostring(err))
+        trace("hot cache load ERROR (%s): %s", store.base_path, tostring(err))
         return false
     end
-    hot_cache = new_cache
-    hot_cache._base = rev
+    store.hot = new_cache
+    store.hot._base = rev
     -- entries may have been filled: retry everything pending this session
-    mem_cache = {}
-    requested = {}
-    trace("hot cache base loaded: %d entries (rev=%s)", count, tostring(rev))
+    store.mem = {}
+    store.requested = {}
+    trace("hot cache base loaded (%s): %d entries (rev=%s)", store.base_path, count, tostring(rev))
     return true
 end
 
-local function load_hot_cache()
-    local base, off, rev = hot_meta()
+local function load_store(store)
+    local base, off, rev = hot_meta(store)
     if rev == nil then
         -- legacy helper (no meta file): fall back to the TSV #rev header
-        local f = io.open(HOME .. "/Library/Rime/rime_translate_cache.tsv", "rb")
+        local f = io.open(store.base_path, "rb")
         if not f then
-            trace("hot cache: unreadable or missing")
+            trace("hot cache (%s): unreadable or missing", store.base_path)
             return false
         end
         local head = f:read(40) or ""
         f:close()
         rev = tonumber(head:match("#rev=(%d+)"))
         if rev == nil then return false end
-        if hot_cache._base == rev then return false end
-        return load_base(HOME .. "/Library/Rime/rime_translate_cache.tsv", rev)
+        if store.hot._base == rev then return false end
+        return load_base(store, rev)
     end
 
-    if hot_cache._base ~= base then
-        return load_base(HOME .. "/Library/Rime/rime_translate_cache.tsv", base)
+    if store.hot._base ~= base then
+        return load_base(store, base)
     end
     -- base unchanged: merge only the new delta bytes (a few lines)
-    local delta_done = hot_cache._delta or 0
+    local delta_done = store.hot._delta or 0
     if off <= delta_done then return false end
-    local path = HOME .. "/Library/Rime/rime_translate_cache.delta"
-    local f = io.open(path, "rb")
+    local f = io.open(store.delta_path, "rb")
     if not f then return false end
     f:seek("set", delta_done)
     local chunk = f:read("*a")
@@ -231,29 +265,29 @@ local function load_hot_cache()
     if complete == "" then return false end
     local added = 0
     for line in complete:gmatch("[^\n]+") do
-        local zh, en = line:match("^(.-)\t(.+)$")
-        if zh and en and en ~= "" then
-            hot_cache[zh] = en
+        local k, v = line:match("^(.-)\t(.+)$")
+        if k and v and v ~= "" then
+            store.hot[k] = v
             added = added + 1
         end
     end
     -- publish even if parse failed: never re-read the same bytes forever
-    hot_cache._delta = off
-    if added > 0 then mem_cache = {} end
-    trace("hot cache delta: +%d (off=%d rev=%d)", added, off, rev)
+    store.hot._delta = off
+    if added > 0 then store.mem = {} end
+    trace("hot cache delta (%s): +%d (off=%d rev=%d)", store.delta_path, added, off, rev)
     return added > 0
 end
 
 -- fire-and-forget miss reporting: a plain file append, never blocks.
 -- The helper drains this file each second and refills the hot cache.
-local function request_word(zh)
-    if requested[zh] then return end
-    requested[zh] = true
-    local f = io.open(HOME .. "/Library/Rime/rime_translate_requests.txt", "a")
+local function request_word(store, key)
+    if store.requested[key] then return end
+    store.requested[key] = true
+    local f = io.open(store.req_path, "a")
     if not f then return end
-    f:write(zh, "\n")
+    f:write(key, "\n")
     f:close()
-    trace("requested: %s", zh)
+    trace("requested (%s): %s", store.req_path, key)
 end
 
 local function is_cjk(text)
@@ -267,6 +301,12 @@ local function is_cjk(text)
         end
     end
     return true
+end
+
+local function is_english_word(text)
+    if not text or text == "" or #text > 40 then return false end
+    return text:match("^[A-Za-z]$") ~= nil
+        or text:match("^[A-Za-z][A-Za-z'%-]*[A-Za-z]$") ~= nil
 end
 
 -- pick first N english words out of "w1|w2|w3|..." joined by separator,
@@ -297,28 +337,85 @@ local function render(en)
     return text
 end
 
-local function lookup(zh)
-    local hit = mem_cache[zh]
+local function render_phonetic(ipa)
+    if not ipa or ipa == "" then return nil end
+    return cfg.phonetic_format == "%s" and ipa
+        or string.format(cfg.phonetic_format, ipa)
+end
+
+local function lookup_store(store, key)
+    local hit = store.mem[key]
     if hit ~= nil then
         return hit == false and nil or hit
     end
-    hit = hot_cache[zh]
+    hit = store.hot[key]
     if hit then
-        mem_cache[zh] = hit
+        store.mem[key] = hit
         return hit
     end
     -- miss: ask the helper asynchronously (file append, zero blocking);
     -- a few keystrokes later the refilled hot cache answers on its own
-    load_hot_cache()
-    hit = hot_cache[zh]
+    load_store(store)
+    hit = store.hot[key]
     if hit then
-        mem_cache[zh] = hit
-        trace("hot hit (after reload): %s", zh)
+        store.mem[key] = hit
+        trace("hot hit (after reload): %s", key)
         return hit
     end
-    request_word(zh)
-    mem_cache[zh] = false
+    request_word(store, key)
+    store.mem[key] = false
     return nil
+end
+
+-- Check whether a switch name is declared in schema `switches` list.
+-- When absent, the feature stays enabled by default without requiring schema edits.
+local function schema_has_switch(env, name)
+    if not name or name == "" then return false end
+    local ok, found = pcall(function()
+        local cfg_obj = env and env.engine and env.engine.schema and env.engine.schema.config
+        if not cfg_obj or not cfg_obj.get_list then return false end
+        local list = cfg_obj:get_list("switches")
+        if not list then return false end
+        for i = 0, list.size - 1 do
+            local item = list:get_at(i)
+            local map = item and item:get_map()
+            local val = map and map:get_value("name")
+            if val and val:get_string() == name then
+                return true
+            end
+        end
+        return false
+    end)
+    return ok and found == true
+end
+
+local function annotate_candidate(cand, rendered)
+    -- shadow candidates created by the simplifier do not
+    -- render comments assigned afterwards; replace them
+    -- with an equivalent plain candidate instead
+    if cand.type == "simplified" or cand.type == "shadow" then
+        local ok2, err2 = pcall(function()
+            local repl = Candidate("simplified", cand.start,
+                cand._end, cand.text, "  " .. rendered)
+            repl.quality = cand.quality
+            trace("replaced: %s [%s]", cand.text, rendered)
+            yield(repl)
+        end)
+        if ok2 then return true end
+        trace("replace FAILED (%s): %s", cand.text, tostring(err2))
+        return false
+    end
+    -- some librime candidate types reject comment writes;
+    -- never let annotation break the candidate stream
+    local ok2, err2 = pcall(function()
+        cand.comment = (cand.comment or "") .. "  " .. rendered
+    end)
+    if not ok2 then
+        trace("comment FAILED (%s): %s", cand.text, tostring(err2))
+    else
+        trace("annotated: %s [%s] type=%s", cand.text, rendered, cand.type)
+    end
+    return false
 end
 
 --------------------------------------------------------------------
@@ -329,7 +426,10 @@ function M.init(env)
     local ok, err = pcall(function()
         open_debug()
         load_config(env)
-        load_hot_cache()
+        has_translate_switch = schema_has_switch(env, cfg.switch_name)
+        has_phonetic_switch = schema_has_switch(env, cfg.phonetic_switch_name)
+        load_store(zh_store)
+        load_store(en_store)
     end)
     if not ok then trace("init ERROR: %s", tostring(err)) end
 end
@@ -343,44 +443,39 @@ function M.fini(env)
 end
 
 function M.func(input, env)
+    local ctx = env and env.engine and env.engine.context
+    local translate_on = cfg.enabled
+    if translate_on and has_translate_switch and ctx and ctx.get_option then
+        translate_on = ctx:get_option(cfg.switch_name)
+    end
+    local phonetic_on = cfg.phonetic_enabled
+    if phonetic_on and has_phonetic_switch and ctx and ctx.get_option then
+        phonetic_on = ctx:get_option(cfg.phonetic_switch_name)
+    end
+
     -- annotate_first_only: annotate at most the first translatable candidate
     -- in this composition (per-keystroke, so it tracks the highlighted word)
     local first_done = false
+    local cand_idx = 0
     for cand in input:iter() do
+        cand_idx = cand_idx + 1
         local handled = false
-        if cfg.enabled and is_cjk(cand.text) and cand.type ~= "raw"
+        if cand_idx == 1 and phonetic_on and is_english_word(cand.text) then
+            local ok, ipa = pcall(lookup_store, en_store, cand.text:lower())
+            if ok and ipa then
+                local rendered = render_phonetic(ipa)
+                if rendered then
+                    handled = annotate_candidate(cand, rendered)
+                end
+            end
+        elseif translate_on and is_cjk(cand.text) and cand.type ~= "raw"
             and not (cfg.annotate_first_only and first_done) then
-            local ok, en = pcall(lookup, cand.text)
+            local ok, en = pcall(lookup_store, zh_store, cand.text)
             if ok and en then
                 local rendered = render(en)
                 if rendered then
                     first_done = true
-                    -- shadow candidates created by the simplifier do not
-                    -- render comments assigned afterwards; replace them
-                    -- with an equivalent plain candidate instead
-                    if cand.type == "simplified" or cand.type == "shadow" then
-                        local ok2, err2 = pcall(function()
-                            local repl = Candidate("simplified", cand.start,
-                                cand._end, cand.text, "  " .. rendered)
-                            repl.quality = cand.quality
-                            handled = true
-                            trace("replaced: %s [%s]", cand.text, rendered)
-                            yield(repl)
-                        end)
-                        if not ok2 then
-                            trace("replace FAILED (%s): %s", cand.text, tostring(err2))
-                        end
-                    else
-                        -- some librime candidate types reject comment writes;
-                        -- never let annotation break the candidate stream
-                        local ok2, err2 = pcall(function()
-                            cand.comment = (cand.comment or "") .. "  " .. rendered
-                        end)
-                        if not ok2 then
-                            trace("comment FAILED (%s): %s", cand.text, tostring(err2))
-                        end
-                        trace("annotated: %s [%s] type=%s", cand.text, rendered, cand.type)
-                    end
+                    handled = annotate_candidate(cand, rendered)
                 end
             end
         end

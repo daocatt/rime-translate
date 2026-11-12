@@ -139,3 +139,69 @@ if os.getenv("FIXTURE") == "home3" then
         Candidate.new("跑"),
     }, { "苹果|  〔apple", "跑|" })
 end
+
+-- English US phonetic (first candidate only) + runtime switch toggle
+if not os.getenv("FIXTURE") then
+    run_case("english word as 1st candidate shows US IPA", {
+        Candidate.new("Apple", "", "table"),
+        Candidate.new("code", "", "table"),
+    }, { "Apple|  美 /ˈæpəl/", "code|" })
+
+    run_case("english word as 2nd candidate is untouched", {
+        Candidate.new("未知词"),
+        Candidate.new("apple", "", "raw"),
+    }, { "未知词|", "apple|" })
+
+    -- simulate schema with `rime_translate` switch
+    local switch_val = false
+    local sw_env = {
+        engine = {
+            schema = {
+                config = {
+                    get_list = function(_, k)
+                        if k ~= "switches" then return nil end
+                        return {
+                            size = 1,
+                            get_at = function(_, i)
+                                return {
+                                    get_map = function()
+                                        return {
+                                            get_value = function(_, fld)
+                                                if fld == "name" then
+                                                    return { get_string = function() return "rime_translate" end }
+                                                end
+                                            end
+                                        }
+                                    end
+                                }
+                            end
+                        }
+                    end
+                }
+            },
+            context = {
+                get_option = function(_, name)
+                    if name == "rime_translate" then return switch_val end
+                    return false
+                end
+            }
+        }
+    }
+    M.init(sw_env)
+    local saved_env = env
+    env = sw_env
+    run_case("runtime switch OFF disables translation (phonetic stays ON)", {
+        Candidate.new("苹果"),
+        Candidate.new("apple", "", "table"),
+    }, { "苹果|", "apple|  美 /ˈæpəl/" })
+
+    switch_val = true
+    run_case("runtime switch ON re-enables translation", {
+        Candidate.new("苹果"),
+    }, { "苹果|  apple" })
+
+    run_case("runtime switch ON re-enables phonetic on 1st candidate", {
+        Candidate.new("apple", "", "raw"),
+    }, { "apple|  美 /ˈæpəl/" })
+    env = saved_env
+end
