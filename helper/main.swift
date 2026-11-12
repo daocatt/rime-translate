@@ -867,8 +867,8 @@ listener.start(queue: .main)
 // must never delay AI translation. doAppendHotDelta/doExportHotCache are
 // serialized on exportQueue, so there's no interleaving hazard.
 Task.detached(priority: .utility) {
-    doExportHotCache(dict)
     doExportPhoneticHotCache(dict)
+    doExportHotCache(dict)
 }
 _ = drainLoop(dict)
 
