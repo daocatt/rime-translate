@@ -11,6 +11,7 @@
 **特性**
 
 - 离线词典 273 万词条：ECDICT（反排清洗）+ CC-CEDICT（原生中英）双源合并
+- **英文音标**：输入英文单词时，首候选显示美音 IPA（如 `apple  /ˈæpəl/`）
 - **打字零阻塞**：常用词微秒级命中；生僻词异步回填，永不卡输入
 - **AI 兜底 + 自我进化**：词典没有的词自动调 Cloudflare Workers AI 翻译，
   结果沉淀到本地库，越用越准
@@ -173,9 +174,30 @@ patch:
   translate/helper_port: 61899
   translate/max_candidate_len: 12       # 超长候选不翻译
   translate/enabled: true               # 总开关
+  translate/phonetic_enabled: true      # 英文单词首候选显示美音音标
+  translate/phonetic_format: "/%s/"     # 音标格式，%s 为 IPA
+  # translate/phonetic_switch_name: "rime_translate_phonetic"
 ```
 
 横竖排会自动跟随主题的 `candidate_list_layout`（linear=横 / stacked=竖）设置。
+
+## 英文音标
+
+输入英文单词时，第一个候选会显示美音 IPA：
+
+```
+apple   /ˈæpəl/
+code    /koʊd/
+```
+
+- 只对**第一个候选**生效，避免候选列表被音标刷屏。
+- 纯中文方案（如朙月拼音）下，只有方案把输入切成 `sentence` 或强制拼音
+  切分（如 `a p p le`）时才当作英文；普通拼音 `shi`、`shixian` 不会被
+  误判成英文。
+- 音标数据来自 [ipa-dict](https://github.com/open-dict-data/ipa-dict)（MIT），
+  已包含在 Release 的 `ecdict.db` 中；自行构建时需加 `--us-ipa en_US.txt`。
+- 关闭：`translate/phonetic_enabled: false`，或在方案 `switches` 中声明
+  `rime_translate_phonetic` 后用菜单/快捷键切换。
 
 ## 工作原理
 

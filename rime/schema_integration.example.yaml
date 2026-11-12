@@ -8,7 +8,8 @@
 #     - name: rime_translate
 #       reset: 1                 # 1=默认开启, 0=默认关闭
 #       states: [ 译关, 译开 ]
-#     # 可选：单独控制英文单词美音音标开关（不加则跟随 rime_translate）
+#     # 可选：单独控制英文单词美音音标开关（独立开关，默认开启；
+#     # 未声明时由 translate/phonetic_enabled 控制）
 #     # - name: rime_translate_phonetic
 #     #   reset: 1
 #     #   states: [ 音关, 音开 ]
