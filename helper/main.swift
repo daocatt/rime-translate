@@ -448,12 +448,18 @@ func writePhoneticMeta(rev: Int) {
     atomicWrite("base=\(phoneticBaseRev) delta_off=\(phoneticDeltaOff) rev=\(rev)\n", to: phoneticHotMetaURL)
 }
 
+func normalizeIPA(_ s: String) -> String {
+    s.replacingOccurrences(of: "ɹ", with: "r")
+     .replacingOccurrences(of: "ɫ", with: "l")
+}
+
 func phoneticTsvEntry(_ word: String, _ ipa: String) -> String? {
     let w = word.lowercased()
-    guard !w.contains("\t"), !ipa.contains("\t"),
-          !ipa.contains("\n"), !ipa.contains("\r"),
-          !w.isEmpty, !ipa.isEmpty else { return nil }
-    return "\(w)\t\(ipa)"
+    let cleanIPA = normalizeIPA(ipa)
+    guard !w.contains("\t"), !cleanIPA.contains("\t"),
+          !cleanIPA.contains("\n"), !cleanIPA.contains("\r"),
+          !w.isEmpty, !cleanIPA.isEmpty else { return nil }
+    return "\(w)\t\(cleanIPA)"
 }
 
 func exportPhoneticHotCache(_ dict: Dict) {
@@ -768,11 +774,11 @@ func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, conn: NWCon
         }
         if let ipa = dict.lookupPhoneticCache(q) {
             return jsonResponse(conn, code: 200,
-                body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\(escapeJSON(ipa))\",\"source\":\"cache\"}")
+                body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\(escapeJSON(normalizeIPA(ipa)))\",\"source\":\"cache\"}")
         }
         if let ipa = dict.lookupPhonetic(q) {
             return jsonResponse(conn, code: 200,
-                body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\(escapeJSON(ipa))\",\"source\":\"dict\"}")
+                body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\(escapeJSON(normalizeIPA(ipa)))\",\"source\":\"dict\"}")
         }
         return jsonResponse(conn, code: 200,
             body: "{\"q\":\"\(escapeJSON(q))\",\"ipa\":\"\",\"source\":\"none\"}")

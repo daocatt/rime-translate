@@ -349,10 +349,19 @@ local function render(en)
     return text
 end
 
+local function normalize_ipa(ipa)
+    if not ipa or ipa == "" then return "" end
+    -- normalize narrow linguistic IPA to dictionary-friendly broad IPA:
+    -- turned-r 'ɹ' (U+0279) -> 'r'
+    -- dark-l 'ɫ' (U+026B) -> 'l'
+    return ipa:gsub("ɹ", "r"):gsub("ɫ", "l")
+end
+
 local function render_phonetic(ipa)
     if not ipa or ipa == "" then return nil end
-    if cfg.phonetic_format == "%s" then return ipa end
-    local ok, text = pcall(string.format, cfg.phonetic_format, ipa)
+    local clean_ipa = normalize_ipa(ipa)
+    if cfg.phonetic_format == "%s" then return clean_ipa end
+    local ok, text = pcall(string.format, cfg.phonetic_format, clean_ipa)
     if not ok then
         trace("phonetic_format ERROR: %s", tostring(text))
         return nil

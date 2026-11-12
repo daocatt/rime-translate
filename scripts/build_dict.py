@@ -192,6 +192,16 @@ def word_score(row, word):
     return score
 
 
+def normalize_us_ipa(ipa):
+    """Normalize narrow linguistic IPA to dictionary-friendly broad IPA:
+    - ɹ (U+0279 turned r) -> standard 'r'
+    - ɫ (U+026B dark l with middle tilde) -> standard 'l'
+    """
+    if not ipa:
+        return ""
+    return ipa.replace("ɹ", "r").replace("ɫ", "l")
+
+
 def parse_us_ipa(path):
     """Parse US IPA dictionary (e.g. open-dict-data/ipa-dict en_US.txt:
     'word\\t/ipa1/, /ipa2/'). Returns {lowercase_word: ipa}."""
@@ -210,7 +220,7 @@ def parse_us_ipa(path):
             # take primary pronunciation, strip surrounding slashes
             first = parts[1].split(",")[0].strip().strip("/")
             if first and w not in ipa_map:
-                ipa_map[w] = first
+                ipa_map[w] = normalize_us_ipa(first)
     return ipa_map
 
 
