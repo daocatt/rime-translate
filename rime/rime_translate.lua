@@ -488,12 +488,14 @@ function M.func(input, env)
                     local rendered = render_phonetic(ipa)
                     if rendered then
                         if from_input then
-                            local preedit_txt = ""
-                            if ctx.get_preedit then
+                            local genuine = cand.get_genuine and cand:get_genuine() or cand
+                            local gtype = genuine.type or cand.type
+                            local preedit_txt = genuine.preedit or cand.preedit or ""
+                            if preedit_txt == "" and ctx.get_preedit then
                                 local ok_p, pe = pcall(function() return ctx:get_preedit().text end)
                                 if ok_p and pe then preedit_txt = pe end
                             end
-                            if cand.type == "sentence" or has_isolated_consonant(preedit_txt) then
+                            if gtype == "sentence" or has_isolated_consonant(preedit_txt) then
                                 local ok2, err2 = pcall(function()
                                     local repl = Candidate("english", cand.start,
                                         cand._end, ctx.input, "  " .. rendered)
