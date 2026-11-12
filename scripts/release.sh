@@ -4,6 +4,7 @@
 # 用法:
 #   zsh scripts/release.sh            # 使用已有 dist/ecdict.db
 #   zsh scripts/release.sh ecdict.csv # 先从 csv 构建
+#   US_IPA=en_US.txt zsh scripts/release.sh ecdict.csv  # 同时打入美音音标
 #
 # 前置条件:
 #   - gh CLI 已登录: gh auth login
@@ -12,13 +13,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 VERSION="${1:-}"
+US_IPA="${US_IPA:-}"
 ASSETS_DIR=dist
 
 if [[ -n "$VERSION" && -f "$VERSION" ]]; then
     echo "==> 从 $VERSION 构建全量词典..."
-    python3 scripts/build_dict.py "$VERSION" -o "$ASSETS_DIR/ecdict.db"
+    if [[ -n "$US_IPA" ]]; then
+        python3 scripts/build_dict.py "$VERSION" --us-ipa "$US_IPA" -o "$ASSETS_DIR/ecdict.db"
+    else
+        echo "warning: US_IPA 未设置，构建出的词典不含音标数据"
+        python3 scripts/build_dict.py "$VERSION" -o "$ASSETS_DIR/ecdict.db"
+    fi
 fi
 [[ -f "$ASSETS_DIR/ecdict.db" ]] || { echo "缺少 dist/ecdict.db"; exit 1; }
+if ! sqlite3 "$ASSETS_DIR/ecdict.db" "SELECT 1 FROM en_phonetic LIMIT 1" >/dev/null 2>&1; then
+    echo "warning: $ASSETS_DIR/ecdict.db 没有 en_phonetic 数据；用 US_IPA=... 重新构建才能发布音标功能"
+fi
 [[ -f "$ASSETS_DIR/rime-translate-helper" ]] || { echo "缺少 helper，先编译:"; \
     echo "  swiftc -O -o /tmp/h1 helper/main.swift -lsqlite3 -target arm64-apple-macosx13.0"; \
     echo "  swiftc -O -o /tmp/h2 helper/main.swift -lsqlite3"; \
@@ -33,7 +43,7 @@ echo "==> 创建 release $TAG 并上传"
 gh release create "$TAG" \
     --repo daocatt/rime-translate \
     --title "rime-translate $TAG" \
-    --notes "离线中英词典 (基于 ECDICT, MIT) + helper 通用二进制 (macOS 13+, arm64/x86_64)" \
+    --notes "离线中英词典 (基于 ECDICT, MIT) + 美音音标 (ipa-dict, MIT) + helper 通用二进制 (macOS 13+, arm64/x86_64)" \
     "$ASSETS_DIR/ecdict.db" \
     "$ASSETS_DIR/rime-translate-helper" \
     "$ASSETS_DIR/rime_translate.lua"

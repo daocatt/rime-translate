@@ -24,11 +24,14 @@ jobs:
           gunzip -f cedict.txt.gz
           curl -fL --retry 3 -o jieba_freq.txt \
             https://raw.githubusercontent.com/fxsjy/jieba/master/extra_dict/dict.txt.small
+          curl -fL --retry 3 -o en_US.txt \
+            https://raw.githubusercontent.com/open-dict-data/ipa-dict/master/data/en_US.txt
 
       - name: Build offline dictionary
         run: |
           python3 scripts/build_dict.py ecdict_sqlite/stardict.db \
-            --cedict cedict.txt --zh-freq jieba_freq.txt -o dist/ecdict.db
+            --cedict cedict.txt --zh-freq jieba_freq.txt \
+            --us-ipa en_US.txt -o dist/ecdict.db
 
       - name: Build helper (universal binary)
         run: |
@@ -46,8 +49,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if [[ "$GITHUB_REF_NAME" == v* ]]; then TAG="$GITHUB_REF_NAME"; else TAG="v$(date +%Y.%m.%d)"; fi
-          NOTES="离线中英词典 (ECDICT+CC-CEDICT, 共273万词条) + helper 通用二进制 (macOS 13+, arm64/x86_64) + lua 插件。
-          数据协议: ECDICT (MIT) + CC-CEDICT (CC-BY-SA 4.0); 代码 MIT。"
+          NOTES="离线中英词典 (ECDICT+CC-CEDICT, 共273万词条) + 美音音标 (ipa-dict) + helper 通用二进制 (macOS 13+, arm64/x86_64) + lua 插件。
+          数据协议: ECDICT (MIT) + CC-CEDICT (CC-BY-SA 4.0) + ipa-dict (MIT); 代码 MIT。"
           gh release create "$TAG" --title "rime-translate $TAG" --notes "$NOTES" \
             dist/ecdict.db dist/rime-translate-helper dist/rime_translate.lua ||
           gh release upload "$TAG" --clobber \

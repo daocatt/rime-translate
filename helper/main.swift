@@ -709,8 +709,9 @@ func handleRequest(_ data: Data, dict: Dict, pending: NegativeCache, conn: NWCon
     case "/health":
         let hasDict = dict.lookupDict("苹果") != nil || dict.topPhrases(1).count > 0
         let ai = dict.aiConfig != nil
+        let phonetic = dict.topPhonetics(1).count > 0
         return jsonResponse(conn, code: 200,
-            body: "{\"status\":\"ok\",\"dict\":\(hasDict),\"ai\":\(ai)}")
+            body: "{\"status\":\"ok\",\"dict\":\(hasDict),\"ai\":\(ai),\"phonetic\":\(phonetic)}")
 
     case "/lookup":
         guard let qStart = target.range(of: "?q=") else {
@@ -832,6 +833,9 @@ if dict.aiConfig == nil {
 }
 if dict.topPhrases(1).isEmpty {
     fputs("warning: dictionary appears empty (\(dbPath))\n", stderr)
+}
+if dict.topPhonetics(1).isEmpty {
+    fputs("warning: en_phonetic is empty; rebuild the dictionary with --us-ipa\n", stderr)
 }
 
 let pending = NegativeCache()

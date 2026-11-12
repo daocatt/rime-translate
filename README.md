@@ -224,8 +224,9 @@ launchctl bootout gui/$(id -u)/com.rimetranslate.helper 2>/dev/null
 ```bash
 # 构建 ECDICT sqlite 可从 https://github.com/skywind3000/ECDICT/releases 下载
 # CC-CEDICT 从 https://www.mdbg.net/chinese/dictionary?page=cedict 下载
+# 美音音标 en_US.txt 从 https://github.com/open-dict-data/ipa-dict 下载
 python3 scripts/build_dict.py stardict.db --cedict cedict.txt \
-    --zh-freq jieba_freq.txt -o dist/ecdict.db
+    --zh-freq jieba_freq.txt --us-ipa en_US.txt -o dist/ecdict.db
 
 # 编译通用二进制 (arm64 + x86_64)
 swiftc -O -o /tmp/h1 helper/main.swift -lsqlite3 -target arm64-apple-macosx13.0
