@@ -276,5 +276,6 @@ zsh scripts/release.sh
 - 本项目代码：**MIT**（见 [LICENSE](LICENSE)）
 - 词典数据：[ECDICT](https://github.com/skywind3000/ECDICT)（MIT）+ [CC-CEDICT](https://www.mdbg.net/chinese/dictionary?page=cedict)（CC-BY-SA 4.0）
   —— 合并后的数据包 `ecdict.db` 按 **CC-BY-SA 4.0** 分发，详见 [`LICENSES/`](LICENSES/)
+- 音标数据：[ipa-dict](https://github.com/open-dict-data/ipa-dict)（MIT，en_US 基于 [cmudict-ipa](https://github.com/lingz/cmudict-ipa)）
 - 构建期使用了 [jieba](https://github.com/fxsjy/jieba) 词频表（Apache-2.0，仅用于排序）
 - 本项目是运行时插件，不包含、不修改、不分发 Squirrel/librime 源码或二进制
