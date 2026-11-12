@@ -145,7 +145,7 @@ if not os.getenv("FIXTURE") then
     run_case("english word as 1st candidate shows US IPA", {
         Candidate.new("Apple", "", "table"),
         Candidate.new("code", "", "table"),
-    }, { "Apple|  美 /ˈæpəl/", "code|" })
+    }, { "Apple|  /ˈæpəl/", "code|" })
 
     run_case("english word as 2nd candidate is untouched", {
         Candidate.new("未知词"),
@@ -193,7 +193,7 @@ if not os.getenv("FIXTURE") then
     run_case("runtime switch OFF disables translation (phonetic stays ON)", {
         Candidate.new("苹果"),
         Candidate.new("apple", "", "table"),
-    }, { "苹果|", "apple|  美 /ˈæpəl/" })
+    }, { "苹果|", "apple|  /ˈæpəl/" })
 
     switch_val = true
     run_case("runtime switch ON re-enables translation", {
@@ -202,6 +202,6 @@ if not os.getenv("FIXTURE") then
 
     run_case("runtime switch ON re-enables phonetic on 1st candidate", {
         Candidate.new("apple", "", "raw"),
-    }, { "apple|  美 /ˈæpəl/" })
+    }, { "apple|  /ˈæpəl/" })
     env = saved_env
 end

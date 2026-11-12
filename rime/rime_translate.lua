@@ -19,7 +19,7 @@
 --     translate/switch_name: "rime_translate"
 --     translate/phonetic_enabled: true
 --     translate/phonetic_switch_name: "rime_translate_phonetic"
---     translate/phonetic_format: "美 /%s/"
+--     translate/phonetic_format: "/%s/"
 --     translate/max_entries_horizontal: 2   # horizontal layout: show N words
 --     translate/max_entries_vertical: 5     # vertical layout: show M words
 --     translate/separator: " / "
@@ -43,7 +43,7 @@ local DEFAULTS = {
     switch_name = "rime_translate",
     phonetic_enabled = true,
     phonetic_switch_name = "rime_translate_phonetic",
-    phonetic_format = "美 /%s/",
+    phonetic_format = "/%s/",
     max_entries_horizontal = 2,
     max_entries_vertical = 5,
     separator = " / ",
@@ -351,8 +351,13 @@ end
 
 local function render_phonetic(ipa)
     if not ipa or ipa == "" then return nil end
-    return cfg.phonetic_format == "%s" and ipa
-        or string.format(cfg.phonetic_format, ipa)
+    if cfg.phonetic_format == "%s" then return ipa end
+    local ok, text = pcall(string.format, cfg.phonetic_format, ipa)
+    if not ok then
+        trace("phonetic_format ERROR: %s", tostring(text))
+        return nil
+    end
+    return text
 end
 
 local function lookup_store(store, key)
@@ -477,10 +482,22 @@ function M.func(input, env)
             if is_english_word(cand.text) then
                 word = cand.text:lower()
             elseif ctx and ctx.input and #ctx.input >= 3 and is_english_word(ctx.input) then
-                -- Fallback for pure-Chinese schemas (e.g. luna_pinyin_simp) without an English translator:
-                -- preedit input is an English word even though candidate #1 is Chinese.
-                word = ctx.input:lower()
-                from_input = true
+                -- Fallback for pure-Chinese schemas (e.g. luna_pinyin_simp) without an English translator.
+                -- Plain pinyin such as "shi"/"shixian" is also ASCII, so a character-class
+                -- check alone would annotate Chinese candidates with English IPA. Only treat
+                -- the raw input as English when the schema clearly failed to segment it:
+                -- a sentence candidate or forced pinyin segmentation ("a p p le").
+                local genuine = cand.get_genuine and cand:get_genuine() or cand
+                local gtype = genuine.type or cand.type
+                local preedit_txt = genuine.preedit or cand.preedit or ""
+                if preedit_txt == "" and ctx.get_preedit then
+                    local ok_p, pe = pcall(function() return ctx:get_preedit().text end)
+                    if ok_p and pe then preedit_txt = pe end
+                end
+                if gtype == "sentence" or has_isolated_consonant(preedit_txt) then
+                    word = ctx.input:lower()
+                    from_input = true
+                end
             end
             if word then
                 local ok, ipa = pcall(lookup_store, en_store, word)
@@ -488,26 +505,16 @@ function M.func(input, env)
                     local rendered = render_phonetic(ipa)
                     if rendered then
                         if from_input then
-                            local genuine = cand.get_genuine and cand:get_genuine() or cand
-                            local gtype = genuine.type or cand.type
-                            local preedit_txt = genuine.preedit or cand.preedit or ""
-                            if preedit_txt == "" and ctx.get_preedit then
-                                local ok_p, pe = pcall(function() return ctx:get_preedit().text end)
-                                if ok_p and pe then preedit_txt = pe end
-                            end
-                            if gtype == "sentence" or has_isolated_consonant(preedit_txt) then
-                                local ok2, err2 = pcall(function()
-                                    local repl = Candidate("english", cand.start,
-                                        cand._end, ctx.input, "  " .. rendered)
-                                    repl.quality = cand.quality
-                                    handled = true
-                                    yield(repl)
-                                end)
-                                if not ok2 then
-                                    trace("english replace FAILED (%s): %s", ctx.input, tostring(err2))
-                                end
+                            local ok2, err2 = pcall(function()
+                                local repl = Candidate("english", cand.start,
+                                    cand._end, ctx.input, "  " .. rendered)
+                                repl.quality = cand.quality
+                                yield(repl)
+                            end)
+                            if ok2 then
+                                handled = true
                             else
-                                handled = annotate_candidate(cand, ctx.input .. " " .. rendered)
+                                trace("english replace FAILED (%s): %s", ctx.input, tostring(err2))
                             end
                         else
                             handled = annotate_candidate(cand, rendered)
