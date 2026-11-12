@@ -309,6 +309,18 @@ local function is_english_word(text)
         or text:match("^[A-Za-z][A-Za-z'%-]*[A-Za-z]$") ~= nil
 end
 
+-- Detect forced pinyin segmentation (e.g. "a p p le", "co o l") where a lone
+-- consonant letter was matched via single-letter initial abbreviation.
+local function has_isolated_consonant(preedit)
+    if not preedit or preedit == "" then return false end
+    for seg in preedit:gmatch("%S+") do
+        if seg:match("^[bcdfghjklmnpqrstwxyzBCDFGHJKLMNPQRSTWXYZ]$") then
+            return true
+        end
+    end
+    return false
+end
+
 -- pick first N english words out of "w1|w2|w3|..." joined by separator,
 -- then apply comment_format and max_comment_chars
 local function render(en)
@@ -461,21 +473,43 @@ function M.func(input, env)
         cand_idx = cand_idx + 1
         local handled = false
         if cand_idx == 1 and phonetic_on then
-            local word, prefix = nil, ""
+            local word, from_input = nil, false
             if is_english_word(cand.text) then
                 word = cand.text:lower()
             elseif ctx and ctx.input and #ctx.input >= 3 and is_english_word(ctx.input) then
                 -- Fallback for pure-Chinese schemas (e.g. luna_pinyin_simp) without an English translator:
                 -- preedit input is an English word even though candidate #1 is Chinese.
                 word = ctx.input:lower()
-                prefix = ctx.input .. " "
+                from_input = true
             end
             if word then
                 local ok, ipa = pcall(lookup_store, en_store, word)
                 if ok and ipa then
                     local rendered = render_phonetic(ipa)
                     if rendered then
-                        handled = annotate_candidate(cand, prefix .. rendered)
+                        if from_input then
+                            local preedit_txt = ""
+                            if ctx.get_preedit then
+                                local ok_p, pe = pcall(function() return ctx:get_preedit().text end)
+                                if ok_p and pe then preedit_txt = pe end
+                            end
+                            if cand.type == "sentence" or has_isolated_consonant(preedit_txt) then
+                                local ok2, err2 = pcall(function()
+                                    local repl = Candidate("english", cand.start,
+                                        cand._end, ctx.input, "  " .. rendered)
+                                    repl.quality = cand.quality
+                                    handled = true
+                                    yield(repl)
+                                end)
+                                if not ok2 then
+                                    trace("english replace FAILED (%s): %s", ctx.input, tostring(err2))
+                                end
+                            else
+                                handled = annotate_candidate(cand, ctx.input .. " " .. rendered)
+                            end
+                        else
+                            handled = annotate_candidate(cand, rendered)
+                        end
                     end
                 end
             end
