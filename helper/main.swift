@@ -230,6 +230,23 @@ final class Dict {
         return out
     }
 
+    /// All phonetic entries for the hot cache file. en_phonetic is compact
+    /// (~126k rows, ~2.7 MB TSV), so exporting everything eliminates misses
+    /// entirely for known vocabulary without needing an async round-trip.
+    func allPhonetics() -> [(word: String, ipa: String)] {
+        guard let db = dbRO else { return [] }
+        var out: [(String, String)] = []
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = "SELECT word, us_ipa FROM en_phonetic ORDER BY frq DESC, word ASC"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((String(cString: sqlite3_column_text(stmt, 0)),
+                        String(cString: sqlite3_column_text(stmt, 1))))
+        }
+        return out
+    }
+
     func allPhoneticCached() -> [(word: String, ipa: String)] {
         guard let db = dbRO else { return [] }
         var out: [(String, String)] = []
@@ -469,7 +486,7 @@ func exportPhoneticHotCache(_ dict: Dict) {
     dict.prunePhoneticCache(keep: 50000)
     let rev = Int(Date().timeIntervalSince1970 * 1000)
     var lines: [String] = ["#rev=\(rev)"]
-    for p in dict.topPhonetics(hotCacheTopN) {
+    for p in dict.allPhonetics() {
         if let e = phoneticTsvEntry(p.word, p.ipa) { lines.append(e) }
     }
     for p in dict.allPhoneticCached() {
