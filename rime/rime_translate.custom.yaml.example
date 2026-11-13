@@ -9,6 +9,9 @@ patch:
   # translate/phonetic_enabled: true
   # translate/phonetic_switch_name: "rime_translate_phonetic"
   # translate/phonetic_format: "/%s/"
+  # 内存安全帽：限制 Lua 虚拟机内静态热词表与运行时 LRU 缓存上限（默认各 200 词，其余由 SQLite 引擎按需供给）
+  # translate/max_hot_cache: 200
+  # translate/max_mem_cache: 200
   # 横向候选（style/horizontal: true）时最多显示几个英文词
   translate/max_entries_horizontal: 2
   # 竖向候选时最多显示几个英文词

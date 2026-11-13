@@ -280,3 +280,11 @@ if os.getenv("FIXTURE") == "home4" then
         Candidate.new("apple", "", "table"),
     }, { "apple|  ˈæpəl" })
 end
+
+-- bounded cache sanity check
+if not os.getenv("FIXTURE") then
+    run_case("bounded LRU keeps phonetic lookup functional", {
+        Candidate.new("apple", "", "table"),
+        Candidate.new("code", "", "table"),
+    }, { "apple|  /ˈæpəl/", "code|" })
+end

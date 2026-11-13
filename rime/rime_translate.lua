@@ -20,6 +20,8 @@
 --     translate/phonetic_enabled: true
 --     translate/phonetic_switch_name: "rime_translate_phonetic"
 --     translate/phonetic_format: "/%s/"
+--     translate/max_hot_cache: 200          -- max entries loaded from base TSV (default: 200)
+--     translate/max_mem_cache: 200          -- max entries in runtime LRU cache (default: 200)
 --     translate/max_entries_horizontal: 2   # horizontal layout: show N words
 --     translate/max_entries_vertical: 5     # vertical layout: show M words
 --     translate/separator: " / "
@@ -44,6 +46,8 @@ local DEFAULTS = {
     phonetic_enabled = true,
     phonetic_switch_name = "rime_translate_phonetic",
     phonetic_format = "/%s/",
+    max_hot_cache = 200,            -- memory cap: load at most N top words into memory
+    max_mem_cache = 200,            -- LRU cap: keep at most N words in runtime session
     max_entries_horizontal = 2,
     max_entries_vertical = 5,
     separator = " / ",
@@ -102,9 +106,11 @@ local function make_cache_store(prefix, req_name)
         delta_path = HOME .. "/Library/Rime/" .. prefix .. ".delta",
         meta_path = HOME .. "/Library/Rime/" .. prefix .. ".meta",
         req_path = HOME .. "/Library/Rime/" .. req_name,
-        mem = {},       -- key -> value; false = pending
-        hot = {},       -- _base, _delta
+        mem = {},           -- key -> value; bounded by LRU
+        mem_order = {},     -- FIFO/LRU eviction array
+        hot = {},           -- base table, bounded by max_hot_cache (default 200)
         requested = {},
+        requested_count = 0,
     }
 end
 
@@ -175,6 +181,8 @@ local function load_config(env)
         if psw and psw ~= "" then cfg.phonetic_switch_name = psw end
         local pfmt = content:match('translate/phonetic_format:%s*[\'"]([^\'"]*)[\'"]')
         if pfmt then cfg.phonetic_format = pfmt end
+        cfg.max_hot_cache = num("translate/max_hot_cache", cfg.max_hot_cache)
+        cfg.max_mem_cache = num("translate/max_mem_cache", cfg.max_mem_cache)
         cfg.max_entries_horizontal = num("translate/max_entries_horizontal", cfg.max_entries_horizontal)
         cfg.max_entries_vertical = num("translate/max_entries_vertical", cfg.max_entries_vertical)
         cfg.helper_port = num("translate/helper_port", cfg.helper_port)
@@ -202,10 +210,28 @@ local function hot_meta(store)
     return tonumber(base), tonumber(off), tonumber(rev)
 end
 
--- full read of the base TSV -- only on init or when the helper rebuilt it
+local function store_put_lru(store, key, val)
+    local max_entries = cfg.max_mem_cache or 200
+    if not store.mem then store.mem = {} end
+    if not store.mem_order then store.mem_order = {} end
+
+    if store.mem[key] == nil then
+        store.mem_order[#store.mem_order + 1] = key
+        while #store.mem_order > max_entries do
+            local oldest = table.remove(store.mem_order, 1)
+            if oldest then
+                store.mem[oldest] = nil
+            end
+        end
+    end
+    store.mem[key] = val
+end
+
+-- full read of the base TSV -- capped at max_hot_cache (default 200) to keep memory lightweight
 local function load_base(store, rev)
     local new_cache = {}
     local count = 0
+    local max_entries = cfg.max_hot_cache or 200
     local ok, err = pcall(function()
         for line in io.lines(store.base_path) do
             if not line:match("^#") then
@@ -213,6 +239,7 @@ local function load_base(store, rev)
                 if k and v and v ~= "" then
                     new_cache[k] = v
                     count = count + 1
+                    if count >= max_entries then break end
                 end
             end
         end
@@ -225,8 +252,11 @@ local function load_base(store, rev)
     store.hot._base = rev
     -- entries may have been filled: retry everything pending this session
     store.mem = {}
+    store.mem_order = {}
     store.requested = {}
-    trace("hot cache base loaded (%s): %d entries (rev=%s)", store.base_path, count, tostring(rev))
+    store.requested_count = 0
+    trace("hot cache base loaded (%s): %d entries (capped at %d, rev=%s)",
+          store.base_path, count, max_entries, tostring(rev))
     return true
 end
 
@@ -267,13 +297,12 @@ local function load_store(store)
     for line in complete:gmatch("[^\n]+") do
         local k, v = line:match("^(.-)\t(.+)$")
         if k and v and v ~= "" then
-            store.hot[k] = v
+            store_put_lru(store, k, v)
             added = added + 1
         end
     end
     -- publish even if parse failed: never re-read the same bytes forever
     store.hot._delta = off
-    if added > 0 then store.mem = {} end
     trace("hot cache delta (%s): +%d (off=%d rev=%d)", store.delta_path, added, off, rev)
     return added > 0
 end
@@ -283,6 +312,11 @@ end
 local function request_word(store, key)
     if store.requested[key] then return end
     store.requested[key] = true
+    store.requested_count = (store.requested_count or 0) + 1
+    if store.requested_count > 1000 then
+        store.requested = { [key] = true }
+        store.requested_count = 1
+    end
     local f = io.open(store.req_path, "a")
     if not f then return end
     f:write(key, "\n")
@@ -376,20 +410,20 @@ local function lookup_store(store, key)
     end
     hit = store.hot[key]
     if hit then
-        store.mem[key] = hit
+        store_put_lru(store, key, hit)
         return hit
     end
     -- miss: ask the helper asynchronously (file append, zero blocking);
     -- a few keystrokes later the refilled hot cache answers on its own
     load_store(store)
-    hit = store.hot[key]
+    hit = store.mem[key] or store.hot[key]
     if hit then
-        store.mem[key] = hit
+        store_put_lru(store, key, hit)
         trace("hot hit (after reload): %s", key)
         return hit
     end
     request_word(store, key)
-    store.mem[key] = false
+    store_put_lru(store, key, false)
     return nil
 end
 
@@ -454,8 +488,12 @@ function M.init(env)
         load_config(env)
         has_translate_switch = schema_has_switch(env, cfg.switch_name)
         has_phonetic_switch = schema_has_switch(env, cfg.phonetic_switch_name)
-        load_store(zh_store)
-        load_store(en_store)
+        if cfg.enabled or has_translate_switch then
+            load_store(zh_store)
+        end
+        if cfg.phonetic_enabled or has_phonetic_switch then
+            load_store(en_store)
+        end
     end)
     if not ok then trace("init ERROR: %s", tostring(err)) end
 end
